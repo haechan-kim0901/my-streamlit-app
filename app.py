@@ -7,7 +7,7 @@ from openai import OpenAI
 client = OpenAI()
 
 # 페이지 설정
-st.set_page_config(page_title="  한영 번역기   ", page_icon="  ")
+st.set_page_config(page_title="MAMAGO", page_icon="🤖")
 st.title("English Translator")
 st.write("영문을 번역해주는 자동 번역기입니다.")
 
