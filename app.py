@@ -929,6 +929,43 @@ QUADRANTS = {
 
 DATE_IN_TEXT = re.compile(r"(20\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})")
 
+def _safe_date(y, m, d):
+    """잘못된 날짜(13월, 2월 30일 등)면 None."""
+    try:
+        y = int(y)
+        if y < 100:          # 26 → 2026
+            y += 2000
+        return date(y, int(m), int(d))
+    except ValueError:
+        return None
+
+# 파일명에서 찾을 날짜 형식 (위에서부터 우선 적용)
+FILENAME_DATE_PATTERNS = [
+    # 2026-11-04, 2026.11.4, 2026_11_04, 2026년 11월 4일, 26.11.04
+    (re.compile(r"(?<!\d)(20\d{2}|\d{2})\s*[-./_년]\s*(\d{1,2})\s*[-./_월]\s*(\d{1,2})(?!\d)"), True),
+    # 20261104
+    (re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)"), True),
+    # 261104
+    (re.compile(r"(?<!\d)(\d{2})(\d{2})(\d{2})(?!\d)"), True),
+    # 11월 4일 (연도 없음 → 올해)
+    (re.compile(r"(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일"), False),
+    # 1104 (연도 없음 → 올해)
+    (re.compile(r"(?<!\d)(\d{2})(\d{2})(?!\d)"), False),
+]
+
+def guess_date_from_filename(name):
+    """회의록 파일명(제목)에 적힌 날짜를 찾는다. 못 찾으면 None."""
+    stem = os.path.splitext(name)[0]
+    for pattern, has_year in FILENAME_DATE_PATTERNS:
+        for m in pattern.finditer(stem):
+            if has_year:
+                d = _safe_date(m[1], m[2], m[3])
+            else:
+                d = _safe_date(today_kst().year, m[1], m[2])
+            if d:
+                return d
+    return None
+
 def guess_meeting_date(text):
     """회의록 앞부분에 적힌 날짜(2026-11-04, 2026.11.04, 2026년 11월 4일)를 찾아 기본값으로 쓴다."""
     m = DATE_IN_TEXT.search(text[:500])
@@ -1732,10 +1769,12 @@ with st.sidebar:
         except UnicodeDecodeError:
             text = raw.decode("cp949", errors="ignore")
         with st.expander(f"📄 {f.name}", expanded=len(meeting_files) == 1):
-            d = st.date_input("📆 회의 날짜", value=guess_meeting_date(text) or today_kst(),
+                        # 우선순위: 파일명(제목)의 날짜 → 회의록 본문 앞부분의 날짜 → 오늘
+            guessed = guess_date_from_filename(f.name) or guess_meeting_date(text) or today_kst()
+            d = st.date_input("📆 회의 날짜", value=guessed,
                               key=f"meeting_date_{i}_{f.name}",
-                              help="'다음 주 금요일' 같은 기한을 날짜로 바꿀 때 기준이 됩니다. "
-                                   "회의록에 날짜가 적혀 있으면 자동으로 채워집니다.")
+                              help="'다음 주 금요일' 같은 기한을 날짜로 바꿀 때 기준이 됩니다."
+                                   "파일 제목이나 회의록에 날짜가 적혀 있으면 자동으로 채워집니다.")
             st.text(text[:1500])
         meetings.append({"name": f.name, "text": text, "date": d})
     meetings.sort(key=lambda m: m["date"])   # 회의 날짜순
