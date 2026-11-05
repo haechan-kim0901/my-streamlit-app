@@ -364,7 +364,20 @@ def finish_draft(action, user_text):
 # ---------------------------------------------------------------
 # 역할 부여 (시스템 프롬프트)
 # ---------------------------------------------------------------
-def build_instructions(meeting_text, recipient, draft=None, deadlines=None):
+# 회의 요약 요청 판별: 모델의 '전체인지 일부인지' 판단에 맡기지 않고 코드에서 정한다
+SUMMARY_WORDS = ("요약", "정리해")
+PARTIAL_WORDS = ("업무", "할 일", "할일", "후속", "액션", "담당", "일정", "마감", "급한", "우선순위",
+                 "메일", "보내", "발송", "검색", "찾아", "지난", "과거", "저장된", "기록 탭")
+
+def classify_request(user_text):
+    """'full_summary'(회의 전체 요약) / None(그 외). 프롬프트의 [이번 요청 분류]에 사용."""
+    text = (user_text or "").replace(" ", "")
+    if any(w.replace(" ", "") in text for w in SUMMARY_WORDS) and \
+            not any(w.replace(" ", "") in text for w in PARTIAL_WORDS):
+        return "full_summary"
+    return None
+
+def build_instructions(meeting_text, recipient, draft=None, deadlines=None, request_kind=None):
     role = """
 [역할]
 당신은 김 대리의 음성인식 AI 개인비서 '에비'입니다.
@@ -405,7 +418,8 @@ def build_instructions(meeting_text, recipient, draft=None, deadlines=None):
 3. 성공하면 "11월 13일(금)에 표시했습니다"처럼 날짜와 함께 알려 주세요.
 
 [회의 기록]
-1. 회의 전체 요약을 요청받았을 때만 save_summary로 저장하세요. 업무 안내나 후속 조치처럼 일부만 묻는 요청에서는 저장하지 마세요.
+1. 회의 요약 요청('회의 내용 요약해 줘', '전체 회의 요약해 줘', '회의 정리해 줘' 등 표현이 달라도 모두 같은 요청)은 항상 [회의 전체 요약] 형식으로 답하고 save_summary로 저장하세요.
+   김 대리 업무 안내, 후속 조치, 특정 항목처럼 회의의 일부만 묻는 요청에서는 저장하지 마세요. 아래 [이번 요청 분류]가 있으면 그 판단을 따르세요.
 2. 회의명은 회의록에서 정하고 지어내지 마세요.
 3. 과거 회의를 요청받으면 search_summaries로 찾아 저장된 내용을 바꾸지 말고 전달하세요. 여러 건이면 날짜와 회의명 목록을 보여 주고 어느 회의인지 되물으세요.
 4. 저장된 요약을 메일로 보내 달라고 하면 search_summaries로 찾은 뒤 send_email로 초안을 만드세요.
@@ -483,6 +497,9 @@ def build_instructions(meeting_text, recipient, draft=None, deadlines=None):
         role += f"\n[회의 기록 시작]\n{meeting_text}\n[회의 기록 끝]\n"
     else:
         role += "\n아직 회의 기록이 업로드되지 않았습니다. 회의 관련 요청이면 업로드를 안내하세요.\n"
+    if request_kind == "full_summary" and meeting_text:
+        role += ("\n[이번 요청 분류] 회의 전체 요약 요청입니다. 추가 질문 없이 [회의 전체 요약] 형식을 그대로 따라 답하고, "
+                 "회의록마다 save_summary로 저장하세요.\n")
     role += deadline_context(deadlines)
     role += priority_context(st.session_state.get("priority_items", []))
     role += ("\n답변이 끝나면 필요할 때만, 김 대리가 이어서 해볼 만한 요청을 한 문장으로 짧게 제안하세요. "
@@ -508,7 +525,7 @@ def transcribe(audio_bytes):
         file=("request.wav", audio_bytes),
         language="ko",
         # 힌트 문장: 비서 이름 '에비'와 자주 쓰는 요청 표현을 알려 주면 받아 적기가 정확해짐
-        prompt="에비, 회의 내용 요약해 줘. 에비, 제일 급한 업무부터 알려줘. 에비, 이 내용 메일로 보내줘.",
+        prompt="에비, 회의 전체 요약해 줘. 에비, 제일 급한 업무부터 알려줘. 에비, 이 내용 메일로 보내줘.",
     )
     return normalize_wake_word(result.text)
 
@@ -581,6 +598,7 @@ def synthesize(text):
 # LLM 호출 (멀티턴 + 도구 사용)
 # ---------------------------------------------------------------
 def ask_able(user_text, history, meeting_text, recipient):
+    request_kind = classify_request(user_text)   # 'full_summary'면 프롬프트에 전체 요약임을 명시
     pending = current_draft()   # 이번 요청 시작 시점에 대기 중인 초안 (화면에서 직접 고친 내용 포함)
     changed = False             # 이번 요청에서 초안을 만들거나 수정했는지 (그렇다면 같은 요청에서 발송 금지)
     messages = list(history) + [{"role": "user", "content": user_text}]
@@ -589,10 +607,11 @@ def ask_able(user_text, history, meeting_text, recipient):
 
     for _ in range(8):  # 도구 호출은 최대 8회까지 (회의록별 요약 저장, 일정 등록 등이 이어질 수 있음)
         instructions = build_instructions(meeting_text, recipient, current_draft(),
-                                          st.session_state.deadlines)
+                                          st.session_state.deadlines, request_kind)
         response = client.responses.create(
             model=MODEL, instructions=instructions, input=messages,
-            tools=available_tools, parallel_tool_calls=False
+            tools=available_tools, parallel_tool_calls=False,
+            temperature=0,   # 같은 요청이면 같은 답이 나오도록 (요약 문장, 우선순위 판정, 도구 선택의 흔들림을 줄임)
         )
         tool_calls = [item for item in response.output if item.type == "function_call"]
         if not tool_calls:
@@ -1971,7 +1990,7 @@ bottom_area = getattr(st, "bottom", None) or getattr(st, "_bottom", None) or st.
 with bottom_area:
     voice_box = st.container()     # 🎤 음성 요청하기: 안내 / 인식 중 / 오류·다시 시도
     # 자주 쓰는 요청: 누르면 해당 문장이 에비에게 바로 전달되고 대화 탭으로 이동
-    quick_requests = [("📋", "회의 내용 요약해 줘"), ("🔥", "제일 급한 업무부터 알려줘"),
+    quick_requests = [("📋", "회의 전체 요약해 줘"), ("🔥", "제일 급한 업무부터 알려줘"),
                       ("📅", "이번 주 마감 일정 알려줘")]
     for col, (icon, text) in zip(st.columns(len(quick_requests)), quick_requests):
         col.button(f"{icon} {text}", key=f"quick_{text}", on_click=ask_in_chat,
