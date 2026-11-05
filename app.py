@@ -1724,7 +1724,7 @@ for key, value in defaults.items():
 with st.sidebar:
     st.image(ROBOT_URL)
 
-    head_col, title_col = st.columns([1, 8], vertical_alignment="center")
+    head_col, title_col = st.columns([1, 6], vertical_alignment="center")
     with head_col:
         st.image(ABLE_HEAD, width=42)
     with title_col:
