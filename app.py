@@ -1724,9 +1724,9 @@ for key, value in defaults.items():
 with st.sidebar:
     st.image(ROBOT_URL)
 
-    head_col, title_col = st.columns([1, 4], vertical_alignment="center")
+    head_col, title_col = st.columns([1, 6], vertical_alignment="center")
     with head_col:
-        st.image(ABLE_HEAD, width=42)
+        st.image(ABLE_HEAD, width=32)
     with title_col:
         st.markdown("### 회의록")
     meeting_files = st.file_uploader("회의록(txt) 파일", type=["txt"], label_visibility="collapsed",
