@@ -1104,22 +1104,6 @@ def switch_to_chat_tab():
         "if (++attempts < 50) setTimeout(activateChat, 100);"
         "} activateChat();</script>", height=0)
 
-def briefing_text(tasks):
-    """회의록을 올리면 에이블이 먼저 건네는 브리핑 메시지 (LLM 호출 없이 결과로 작성)."""
-    if not tasks:
-        return ("김 대리님, 회의록 잘 읽었어요! 📄 이번 회의에서 김 대리님께 배정된 업무는 찾지 못했어요.\n\n"
-                "회의 내용이 궁금하시면 \"회의 내용 요약해 줘\"라고 말씀해 주세요.")
-    first = [t for t in tasks if t["quadrant"]["order"] == 1]
-    lines = [f"김 대리님, 회의록 잘 읽었어요! 📄 배정된 업무는 총 **{len(tasks)}개**예요.", ""]
-    for t in tasks:
-        lines.append(f"- {t['quadrant']['icon']} **{t['task']}** · {fmt_dday(t['d_day'])} · {t['quadrant']['action']}")
-    lines.append("")
-    if first:
-        lines.append(f"가장 먼저 챙기실 일은 **{first[0]['task']}**이에요. 어떻게 시작할지 같이 정리해 드릴까요?")
-    else:
-        lines.append("급한 일은 없어요. 중요한 업무부터 계획을 세워 보는 건 어떨까요?")
-    return "\n".join(lines)
-
 def render_priority_tab(tasks):
     """④ 화면: 슬라이드와 같은 배치의 2×2 매트릭스 + 표."""
     st.caption(f"긴급: 마감까지 {URGENT_DAYS}일 이내 또는 '빨리' 요청 · 중요: 중요도 {IMPORTANT_SCORE}점 이상 "
@@ -1442,6 +1426,11 @@ def show_pdf_preview(record):
             if len(pages) > 1:
                 st.caption(f"{no} / {len(pages)} 페이지")
 
+def toggle_summary_preview(record_id):
+    """대화 탭의 '요약 보고서 미리보기' 버튼: 누를 때마다 열고 닫는다."""
+    current = st.session_state.get("preview_summary_id")
+    st.session_state.preview_summary_id = None if current == record_id else record_id
+
 def render_records_tab(recipient):
     """회의 기록 탭: 저장된 요약을 검색하고, 메일로 보내거나 삭제한다."""
     keyword = st.text_input("🔎 회의 기록 검색", placeholder="회의명이나 내용 키워드")
@@ -1600,13 +1589,15 @@ def render_deadline_tab():
 
     st.markdown("##### ✏️ 마감 일정 목록 (수정 · 추가 · 삭제 가능)")
     st.caption("AI가 찾은 결과는 틀릴 수 있어요. 표에서 직접 고치면 달력과 에이블의 답변에 바로 반영됩니다.")
+    # 목록이 비어 있어도(분석 전) 열 타입이 맞도록 자료형을 직접 지정한다.
+    # 빈 리스트는 pandas가 float64로 만들어 체크박스/텍스트 열 설정과 충돌하기 때문.
     df = pd.DataFrame({
-        "id": [i["id"] for i in items],
-        "업무": [i["task"] for i in items],
-        "담당자": [i["assignee"] for i in items],
-        "마감일": pd.to_datetime([i["due"] for i in items]),
-        "김 대리 업무": [i["is_kim"] for i in items],
-        "원문 표현": [i["due_text"] for i in items],
+        "id": pd.Series([i["id"] for i in items], dtype="object"),
+        "업무": pd.Series([i["task"] for i in items], dtype="object"),
+        "담당자": pd.Series([i["assignee"] for i in items], dtype="object"),
+        "마감일": pd.Series(pd.to_datetime([i["due"] for i in items]), dtype="datetime64[ns]"),
+        "김 대리 업무": pd.Series([bool(i["is_kim"]) for i in items], dtype="bool"),
+        "원문 표현": pd.Series([i["due_text"] for i in items], dtype="object"),
     })
     edited = st.data_editor(
         df, num_rows="dynamic", hide_index=True, use_container_width=True,
@@ -1686,8 +1677,7 @@ def render_deadline_tab():
                        file_name="able_deadlines.ics", mime="text/calendar",
                        use_container_width=True, disabled=not dated)
     if b2.button("🔄 업무 다시 추출", use_container_width=True):
-        st.session_state.deadline_key = None
-        st.session_state.skip_briefing = True
+        st.session_state.analyze_request = "redo"   # 브리핑 없이 다시 추출
         st.rerun()
     return deadlines
 
@@ -1696,7 +1686,8 @@ def render_deadline_tab():
 # ---------------------------------------------------------------
 defaults = {
     "deadline_items": [],    # 회의록에서 추출한 마감 일정 (편집기 초기값)
-    "deadline_key": None,    # 마지막으로 추출한 회의록/날짜 식별값
+    "analyzed_key": None,    # 업무 추출을 마친 회의록/날짜 식별값 (업로드만으로는 추출하지 않음)
+    "analyze_failed_key": None,  # 요청으로 자동 추출하다 실패한 회의록 (같은 회의록에서 반복 실패 방지)
     "deadline_version": 0,   # 마감 일정 편집기 초기화용
     "deadline_changed": False,  # 이번 요청에서 도구가 마감 일정을 바꿨는지
     "cal_month": None,       # 달력에 표시 중인 달 (그 달의 1일)
@@ -1802,13 +1793,17 @@ with head_right:
 # 최신 버전은 공식 상태 제어를 사용하고, 구버전은 아래의 브라우저 이동을 사용한다.
 supports_tab_state = {"key", "on_change"}.issubset(inspect.signature(st.tabs).parameters)
 go_to_chat = st.session_state.pop("chat_navigation", False)
-if go_to_chat and supports_tab_state:
+if go_to_chat and supports_tab_state and st.session_state.get("main_tabs") != "💬 대화":
+    # 다른 탭에서 요청한 경우: 탭만 먼저 바꾸고 바로 다시 그린다.
+    # (요청은 chip_request에 남아 있으므로 다음 실행에서 대화 탭이 열린 상태로 처리됨)
     st.session_state.main_tabs = "💬 대화"
+    st.rerun()
 tab_options = {"key": "main_tabs", "on_change": "rerun"} if supports_tab_state else {}
 tab_chat, tab_pri, tab_rec, tab_cal = st.tabs(
     ["💬 대화", "🎯 우선순위", "🗂️ 회의 기록", "📅 마감 달력"], **tab_options)
-if go_to_chat:
-    # 상태 제어가 안 되는 버전이거나 반영이 늦을 때를 대비해 브라우저에서도 대화 탭을 누른다
+if go_to_chat and not supports_tab_state:
+    # 탭 상태 제어가 안 되는 구버전에서만 브라우저에서 대화 탭을 누른다.
+    # 최신 버전에서 누르면 탭의 on_change="rerun"이 실행 중인 답변 생성을 끊어 버린다.
     switch_to_chat_tab()
 
 with tab_chat:
@@ -1887,41 +1882,53 @@ with tab_rec:
 # ---------------------------------------------------------------
 # 마감 달력 탭: 회의록이 바뀌면 마감 일정을 다시 추출 (에이블 답변보다 먼저 실행해 목록을 반영)
 # ---------------------------------------------------------------
+analyzed = False
 if meeting_text:
     priority_key = hashlib.md5(f"{meeting_text}|{meeting_date}".encode()).hexdigest()
-    if st.session_state.priority_key != priority_key or st.session_state.deadline_key is None:
-        # try 밖에서 꺼내야 실패해도 플래그가 남지 않음
-        skip_briefing = st.session_state.pop("skip_briefing", False)
+    if st.session_state.priority_key != priority_key:
+        # 회의록(또는 회의 날짜)이 바뀜: 이전 회의록의 결과만 비우고, 사용자가 실행할 때까지 기다린다
+        if st.session_state.priority_key is not None:
+            set_deadlines([])
+            st.session_state.deadline_changed = False
+        st.session_state.priority_key = priority_key
+        st.session_state.analyzed_key = None
+        st.session_state.analyze_failed_key = None
+
+    # 실행 조건: ① 사용자가 에이블에게 요청(채팅·음성·자주 쓰는 요청)을 보냈는데 아직 추출 전
+    #            ② 마감 달력의 '업무 다시 추출' 버튼
+    # 업로드만으로는 아무것도 실행하지 않는다 (파일만 첨부된 상태로 대기)
+    reason = st.session_state.pop("analyze_request", None)
+    if (reason is None and st.session_state.get("chip_request")
+            and st.session_state.analyzed_key != priority_key
+            and st.session_state.analyze_failed_key != priority_key):
+        reason = "command"
+    if reason:
         with st.spinner("에이블이 업무를 정리하는 중..."):
             try:
                 items = extract_tasks(meeting_text, meeting_date)
                 set_deadlines(items)
                 st.session_state.deadline_changed = False
-                if not skip_briefing:
-                    add_message(role="assistant", content=briefing_text(st.session_state.priority_items))
+                st.session_state.analyzed_key = priority_key
             except Exception as e:
                 st.error(f"업무 추출 중 오류가 발생했습니다: {e}")
-                # 다른 회의록으로 바꿨다가 실패한 경우에만 이전 회의록 업무를 비움
-                if st.session_state.priority_key != priority_key:
-                    set_deadlines([])
-                    st.session_state.deadline_changed = False
-        # 성공·실패와 관계없이 기록 → 실패 시 무한 재호출 방지
-        st.session_state.priority_key = priority_key
-        st.session_state.deadline_key = priority_key
+                st.session_state.analyze_failed_key = priority_key
+    analyzed = st.session_state.analyzed_key == priority_key
 else:
     if st.session_state.priority_key is not None:   # 회의록을 방금 지운 경우에만 비움
         set_deadlines([])
         st.session_state.deadline_changed = False
     st.session_state.priority_key = None
+    st.session_state.analyzed_key = None
 
 set_deadlines(st.session_state.deadline_items, refresh_editor=False)
 
 with tab_cal:
     if not meeting_text and not st.session_state.deadline_items:
         st.session_state.deadlines = []
-        st.session_state.deadline_key = None
-        st.info("왼쪽에서 회의록(txt)을 업로드하면 마감 일정을 자동으로 찾아 달력에 표시합니다. "
+        st.info("왼쪽에서 회의록(txt)을 업로드하고 에이블에게 요청하면 마감 일정을 찾아 달력에 표시합니다. "
                 "에이블에게 \"다음 주 금요일에 ○○ 마감 표시해줘\"라고 말해도 됩니다.")
+    elif meeting_text and not analyzed:
+        st.info("회의록이 첨부되어 있어요. 에이블에게 요청하면 마감 일정을 찾아 달력에 표시합니다.")
     elif meeting_text:
         if len(meetings) > 1:
             st.caption("회의록 " + ", ".join(f"{m['name']}({m['date'].isoformat()})" for m in meetings)
@@ -1937,19 +1944,25 @@ with tab_cal:
 with tab_pri:
     if st.session_state.priority_items:
         render_priority_tab(st.session_state.priority_items)
+    elif meeting_text and not analyzed:
+        st.info("회의록이 첨부되어 있어요. 에이블에게 요청하면 김 대리님 업무를 긴급·중요 기준으로 나눠 보여 드려요.")
     elif meeting_text:
         st.info("이번 회의록에서 김 대리님께 배정된 업무를 찾지 못했어요.")
     else:
-        st.info("왼쪽에서 회의록(txt)을 업로드하면 김 대리님 업무를 긴급·중요 기준으로 나눠 보여 드려요.")
+        st.info("왼쪽에서 회의록(txt)을 업로드하고 에이블에게 요청하면 김 대리님 업무를 긴급·중요 기준으로 나눠 보여 드려요.")
 
 # ---------------------------------------------------------------
 # 이번 실행에서 처리할 요청 결정: 버튼 요청 > 텍스트 > 새 녹음
 # ---------------------------------------------------------------
 pending_text, pending_src = None, "text"
-chip = st.session_state.pop("chip_request", None)
+# 답변이 저장될 때까지 지우지 않는다 → 처리 도중 화면이 다시 실행돼도 요청이 사라지지 않음
+chip = st.session_state.get("chip_request")
 if chip:
     pending_text = chip
-    st.session_state.pop("go_chat", None)     # 대화 탭 이동은 탭을 만들 때 처리함
+
+def finish_request():
+    st.session_state.pop("chip_request", None)
+    st.session_state.chip_user_added = False
 
 # ---------------------------------------------------------------
 # 대화 영역: 기존 대화 출력 + 새 요청 처리
@@ -1958,9 +1971,8 @@ with chat_area:
     old = st.session_state.messages
     if not old and not pending_text:
         with st.chat_message("assistant", avatar=ROBOT_AVATAR):
-            st.markdown("안녕하세요, 김 대리님! 개인비서 **에이블**입니다. 👋")
-            if not meetings:
-                st.warning("먼저 왼쪽에서 회의록(txt)을 업로드해 주세요.")
+            st.markdown("안녕하세요, 김 대리님! 개인비서 **에이블**입니다. 👋\n\n"
+                        "**어떤 업무를 도와드릴까요?**")
             st.markdown("- 아래에서 **음성 녹음** 또는 **채팅**으로 요청하세요.\n"
                         "- 입력창 바로 위의 **자주 쓰는 요청** 버튼도 사용할 수 있어요.")
 
@@ -1981,12 +1993,18 @@ with chat_area:
     if pending_text:
         src = pending_src
         user_text = pending_text
+        # 이전 실행에서 사용자 메시지까지 넣고 끊겼다면 다시 넣지 않고 답변만 이어서 만든다
+        resumed = st.session_state.get("chip_user_added", False)
         try:
             # LLM에 보낼 대화 히스토리: 새 메시지를 추가하기 전의 text 메시지 최근 N개
-            history = [{"role": m["role"], "content": m["content"]}
-                       for m in st.session_state.messages if m["kind"] == "text"][-MAX_HISTORY:]
+            texts = [m for m in st.session_state.messages if m["kind"] == "text"]
+            if resumed and texts and texts[-1]["role"] == "user":
+                texts = texts[:-1]          # 이미 화면에 있는 이번 요청 메시지는 제외
+            history = [{"role": m["role"], "content": m["content"]} for m in texts][-MAX_HISTORY:]
 
-            render_message(add_message(role="user", content=user_text, src=src))
+            if not resumed:
+                render_message(add_message(role="user", content=user_text, src=src))
+                st.session_state.chip_user_added = True
             n_before = len(st.session_state.messages)
 
             with st.spinner("답변 준비 중..."):
@@ -2012,6 +2030,7 @@ with chat_area:
             for m in st.session_state.messages[n_before:]:
                 render_message(m)
             answer_msg = add_message(role="assistant", content=answer, audio=audio)
+            finish_request()                # 답변까지 저장됐으므로 요청을 끝냄
             prune_audio()
             render_message(answer_msg, show_text or not audio, autoplay=True)
             if src == "voice":
@@ -2021,6 +2040,7 @@ with chat_area:
                 st.session_state.last_audio_hash = None
                 st.session_state.recorder_key += 1
         except Exception as e:
+            finish_request()                # 오류가 나도 같은 요청을 계속 반복하지 않음
             st.error(f"오류가 발생했습니다: {e}")
 
 # 에이블이 달력이나 회의 기록을 바꿨다면 해당 탭이 새 값으로 보이도록 화면을 한 번 다시 그림 (대화는 이미 저장됨)
@@ -2036,10 +2056,15 @@ if st.session_state.last_summary_id is not None:
     record = next((x for x in load_summaries() if x["id"] == st.session_state.last_summary_id), None)
     if record:
         with report_area:
-            c1, c2 = st.columns([3, 1.3])
-            c1.success(f"📝 회의 요약을 저장했습니다: {record['meeting_date']} {record['title']}")
-            pdf_download_button(record, key="pdf_latest", container=c2)
-            with st.expander("👁️ 요약 보고서(PDF) 미리보기"):
+            # 저장 완료 안내는 전체 너비로, 그 아래에 버튼 2개를 나란히 둔다
+            st.success(f"📝 회의 요약을 저장했습니다: {record['meeting_date']} {record['title']}")
+            previewing = st.session_state.get("preview_summary_id") == record["id"]
+            c1, c2 = st.columns(2)
+            pdf_download_button(record, key="pdf_latest", container=c1)
+            c2.button("🙈 요약 보고서 닫기" if previewing else "👁️ 요약 보고서 미리보기",
+                      key="preview_latest", use_container_width=True,
+                      on_click=toggle_summary_preview, args=(record["id"],))
+            if previewing:
                 show_pdf_preview(record)
 
 
@@ -2077,5 +2102,3 @@ with download_area:
         file_name="able_chat.txt", mime="text/plain",
         use_container_width=True, disabled=not st.session_state.messages,
     )
-
-
