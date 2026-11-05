@@ -57,7 +57,7 @@ ABLE_HEAD = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAPAAAAC2CAYAAADnVADjAACkVE
 ROBOT_URL = ABLE_MASCOT
 USER_AVATAR = "🧑‍💼"
 ROBOT_AVATAR = ABLE_HEAD    # 웃는 헤드셋 로봇 얼굴 아이콘
-CHAT_HEIGHT = 500      # 대화 영역 높이(px)
+CHAT_HEIGHT = 800      # 대화 영역 높이(px)
 MAX_HISTORY = 10       # LLM에 전달하는 대화 개수
 KEEP_AUDIO = 10        # 음성을 보관하는 최근 답변 개수
 QUAD_HEIGHT = 300      # 우선순위 4분면 각 칸의 업무 목록 높이(px), 넘치면 스크롤
@@ -580,7 +580,7 @@ def ask_able(user_text, history, meeting_text, recipient):
                     result = save_summary(arguments.get("title", ""), arguments.get("meeting_date", ""),
                                           arguments.get("summary", ""))
                     if result.get("status") == "success":
-                        st.session_state.last_summary_id = result["id"]   # 대화 탭에 PDF 버튼 표시용
+                        st.session_state.request_summary_ids.append(result["id"])  # 답변 아래 PDF 버튼 표시용
                     st.session_state.deadline_changed = True   # 회의 기록 탭을 새 값으로 다시 그리기 위함
                 elif item.name == "search_summaries":
                     result = search_summaries(arguments.get("keyword", ""), arguments.get("date_from", ""),
@@ -613,6 +613,7 @@ def now_str():
     return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%H:%M")
 
 def add_message(**kwargs):
+    kwargs.setdefault("uid", uuid.uuid4().hex)
     kwargs.setdefault("kind", "text")
     kwargs.setdefault("time", now_str())
     st.session_state.messages.append(kwargs)
@@ -650,6 +651,24 @@ def render_message(m, show_text=True, autoplay=False):
                 st.caption("(텍스트 숨김 모드: 음성으로 확인하세요)")
             if m.get("audio"):
                 st.audio(m["audio"], format="audio/mp3", autoplay=autoplay)
+            for rid in m.get("summary_ids", []):
+                render_summary_actions(rid, m.get("uid", ""))
+
+def render_summary_actions(record_id, msg_uid):
+    """요약 답변 아래: 저장 완료 안내(전체 너비) + PDF 저장 / 미리보기 버튼 2개."""
+    record = next((x for x in load_summaries() if x["id"] == record_id), None)
+    if not record:          # 회의 기록 탭에서 삭제된 요약
+        return
+    key = f"{msg_uid}_{record_id}"
+    st.success(f"📝 회의 요약을 저장했습니다: {record['meeting_date']} {record['title']}")
+    previewing = st.session_state.get("preview_summary_key") == key
+    c1, c2 = st.columns(2)
+    pdf_download_button(record, key=f"pdf_{key}", container=c1)
+    c2.button("🙈 요약 보고서 닫기" if previewing else "👁️ 요약 보고서 미리보기",
+              key=f"preview_{key}", use_container_width=True,
+              on_click=toggle_summary_preview, args=(key,))
+    if previewing:
+        show_pdf_preview(record)
 
 def transcript_text():
     lines = []
@@ -928,43 +947,6 @@ QUADRANTS = {
 }
 
 DATE_IN_TEXT = re.compile(r"(20\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})")
-
-def _safe_date(y, m, d):
-    """잘못된 날짜(13월, 2월 30일 등)면 None."""
-    try:
-        y = int(y)
-        if y < 100:          # 26 → 2026
-            y += 2000
-        return date(y, int(m), int(d))
-    except ValueError:
-        return None
-
-# 파일명에서 찾을 날짜 형식 (위에서부터 우선 적용)
-FILENAME_DATE_PATTERNS = [
-    # 2026-11-04, 2026.11.4, 2026_11_04, 2026년 11월 4일, 26.11.04
-    (re.compile(r"(?<!\d)(20\d{2}|\d{2})\s*[-./_년]\s*(\d{1,2})\s*[-./_월]\s*(\d{1,2})(?!\d)"), True),
-    # 20261104
-    (re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)"), True),
-    # 261104
-    (re.compile(r"(?<!\d)(\d{2})(\d{2})(\d{2})(?!\d)"), True),
-    # 11월 4일 (연도 없음 → 올해)
-    (re.compile(r"(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일"), False),
-    # 1104 (연도 없음 → 올해)
-    (re.compile(r"(?<!\d)(\d{2})(\d{2})(?!\d)"), False),
-]
-
-def guess_date_from_filename(name):
-    """회의록 파일명(제목)에 적힌 날짜를 찾는다. 못 찾으면 None."""
-    stem = os.path.splitext(name)[0]
-    for pattern, has_year in FILENAME_DATE_PATTERNS:
-        for m in pattern.finditer(stem):
-            if has_year:
-                d = _safe_date(m[1], m[2], m[3])
-            else:
-                d = _safe_date(today_kst().year, m[1], m[2])
-            if d:
-                return d
-    return None
 
 def guess_meeting_date(text):
     """회의록 앞부분에 적힌 날짜(2026-11-04, 2026.11.04, 2026년 11월 4일)를 찾아 기본값으로 쓴다."""
@@ -1463,10 +1445,10 @@ def show_pdf_preview(record):
             if len(pages) > 1:
                 st.caption(f"{no} / {len(pages)} 페이지")
 
-def toggle_summary_preview(record_id):
-    """대화 탭의 '요약 보고서 미리보기' 버튼: 누를 때마다 열고 닫는다."""
-    current = st.session_state.get("preview_summary_id")
-    st.session_state.preview_summary_id = None if current == record_id else record_id
+def toggle_summary_preview(key):
+    """요약 답변 아래 '요약 보고서 미리보기' 버튼: 누를 때마다 열고 닫는다."""
+    current = st.session_state.get("preview_summary_key")
+    st.session_state.preview_summary_key = None if current == key else key
 
 def render_records_tab(recipient):
     """회의 기록 탭: 저장된 요약을 검색하고, 메일로 보내거나 삭제한다."""
@@ -1517,6 +1499,12 @@ CAL_CSS = (
     ".able-cal .pill{font-size:11px;color:#fff;border-radius:4px;padding:1px 5px;margin-bottom:2px;"
     "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
     # 우선순위 색: 1 빨강(긴급·중요) · 2 파랑(중요) · 3 주황(긴급) · 4 회색(둘 다 아님)
+    ".able-cal .pill{display:flex;align-items:center;justify-content:space-between;gap:4px;white-space:normal;}"
+    "[class*='st-key-caldone_']{display:none;}"
+    ".able-cal .pill .cb{cursor:pointer;flex:none;width:14px;height:14px;border:1.5px solid rgba(255,255,255,.9);border-radius:3px;"
+    "font-size:11px;line-height:12px;text-align:center;}"
+    ".able-cal .etc .cb{border-color:rgba(128,128,128,.8);}"
+    ".able-cal .pill.done{opacity:.55;}.able-cal .pill.done .t{text-decoration:line-through;}"
     ".able-cal .p1{background:#E5484D;}.able-cal .p2{background:#3E63DD;}"
     ".able-cal .p3{background:#F76B15;}.able-cal .p4{background:#8B8D98;}"
     ".able-cal .kim{background:#12A594;}"   # 김 대리 업무지만 우선순위 분류 전
@@ -1608,13 +1596,74 @@ def month_grid_html(year, month, dated, today, max_items=3, priority_items=None)
             styled.sort(key=lambda x: rank[x[1]])
             items = styled
             pills = "".join(
-                f"<div class='pill {cls}' title='{escape(label)} · {escape(d['task'])}'>"
-                f"{icon}{escape(d['task'])}</div>" for d, cls, icon, label in items[:max_items])
+                f"<div class='pill {cls}{' done' if d.get('done') else ''}' "
+                f"title='{escape(label)} · {escape(d['task'])}'>"
+                f"<span class='t'>{icon}{escape(d['task'])}</span>"
+                f"<span class='cb' data-id='{d['id']}'>{'✓' if d.get('done') else ''}</span></div>"
+                for d, cls, icon, label in items[:max_items])
             more = f"<div class='more'>+{len(items) - max_items}건 더</div>" if len(items) > max_items else ""
             cells.append(f"<td class='{cls.strip()}'><div class='num'>{day.day}</div>{pills}{more}</td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
     # 줄바꿈/들여쓰기가 없어야 마크다운이 코드 블록으로 오인하지 않는다
     return CAL_CSS + "<table class='able-cal'>" + "".join(rows) + "</table>"
+
+def _after_deadline_edit(month=None):
+    """달력에서 일정을 바꾼 뒤: 표를 새 값으로 다시 그리되 보던 달은 유지한다."""
+    st.session_state.deadline_version += 1
+    st.session_state.cal_version = st.session_state.deadline_version
+    if month:
+        st.session_state.cal_month = month.replace(day=1)
+
+def toggle_done(task_id):
+    """달력의 체크박스: 완료 상태를 뒤집는다."""
+    for d in st.session_state.deadline_items:
+        if d["id"] == task_id:
+            d["done"] = not d.get("done", False)
+    _after_deadline_edit()
+
+def set_due_date(task_id, key):
+    """날짜 미정 일정에 날짜를 지정한다."""
+    due = st.session_state.get(key)
+    for d in st.session_state.deadline_items:
+        if d["id"] == task_id and due:
+            d["due"] = due
+    _after_deadline_edit(due)
+
+CAL_MD_COLORS = {"p1": "red", "p2": "blue", "p3": "orange", "p4": "gray", "kim": "green"}
+
+def render_month_checkboxes(year, month, dated, today, priority_items):
+    """체크박스가 들어 있는 월간 달력 (칸마다 업무 + 완료 체크)."""
+    by_day = {}
+    for d in dated:
+        by_day.setdefault(d["due"], []).append(d)
+    rank = {"p1": 1, "p2": 2, "p3": 3, "p4": 4, "kim": 5, "etc": 6}
+    for col, name in zip(st.columns(7), "일월화수목금토"):
+        color = "#e5484d" if name == "일" else "#4f7cff" if name == "토" else "inherit"
+        col.markdown(f"<div style='text-align:center;font-weight:600;color:{color}'>{name}</div>",
+                     unsafe_allow_html=True)
+    for week in pycal.Calendar(firstweekday=6).monthdatescalendar(year, month):
+        for col, day in zip(st.columns(7), week):
+            with col.container(border=True, height=150):
+                if day == today:
+                    st.markdown(f":blue[**{day.day}**]")
+                elif day.month != month:
+                    st.caption(f":gray[{day.day}]")
+                else:
+                    st.caption(str(day.day))
+                styled = [(d, *pill_style(d, priority_items)) for d in by_day.get(day, [])]
+                styled.sort(key=lambda x: rank[x[1]])
+                for d, cls, icon, label in styled:
+                    done = bool(d.get("done"))
+                    text = d["task"].replace("[", "\\[").replace("]", "\\]")
+                    color = CAL_MD_COLORS.get(cls)
+                    if done:
+                        shown = f":gray[~~{text}~~]"
+                    elif color:
+                        shown = f":{color}-background[{icon}{text}]"
+                    else:
+                        shown = f"{icon}{text}"
+                    st.checkbox(shown, value=done, key=f"cal_done_{d['id']}_{int(done)}",
+                                on_change=toggle_done, args=(d["id"],), help=label)
 
 def render_deadline_tab():
     """마감 달력 탭: 요약, 월간 달력, 수정 가능한 목록, .ics 다운로드. 확정된 목록을 반환한다."""
@@ -1623,6 +1672,7 @@ def render_deadline_tab():
 
     summary_area = st.container()
     cal_area = st.container()
+    undated_area = st.container()   # 날짜 미정 일정: 표 위에 표시 (아래에서 채움)
 
     st.markdown("##### ✏️ 마감 일정 목록 (수정 · 추가 · 삭제 가능)")
     st.caption("AI가 찾은 결과는 틀릴 수 있어요. 표에서 직접 고치면 달력과 에이블의 답변에 바로 반영됩니다.")
@@ -1634,6 +1684,7 @@ def render_deadline_tab():
         "담당자": pd.Series([i["assignee"] for i in items], dtype="object"),
         "마감일": pd.Series(pd.to_datetime([i["due"] for i in items]), dtype="datetime64[ns]"),
         "김 대리 업무": pd.Series([bool(i["is_kim"]) for i in items], dtype="bool"),
+        "완료": pd.Series([bool(i.get("done")) for i in items], dtype="bool"),
         "원문 표현": pd.Series([i["due_text"] for i in items], dtype="object"),
     })
     edited = st.data_editor(
@@ -1643,6 +1694,7 @@ def render_deadline_tab():
             "id": None,
             "마감일": st.column_config.DateColumn("마감일", format="YYYY-MM-DD"),
             "김 대리 업무": st.column_config.CheckboxColumn("김 대리 업무"),
+            "완료": st.column_config.CheckboxColumn("완료", help="체크하면 달력에서 취소선으로 표시돼요"),
         },
     )
 
@@ -1653,6 +1705,7 @@ def render_deadline_tab():
         if not task:
             continue
         flag = row.get("김 대리 업무")
+        done = row.get("완료")
         deadlines.append({
             **original_by_id.get(clean(row.get("id")), {}),
             "task": task,
@@ -1660,6 +1713,7 @@ def render_deadline_tab():
             "due": parse_date(row.get("마감일")),
             "is_kim": False if flag is None or clean(flag) == "" else bool(flag),
             "due_text": clean(row.get("원문 표현")),
+            "done": False if done is None or clean(done) == "" else bool(done),
         })
 
     changed = deadlines != items
@@ -1705,17 +1759,37 @@ def render_deadline_tab():
                                         priority_items=st.session_state.get("priority_items", [])),
                         unsafe_allow_html=True)
             st.markdown(CAL_CSS + priority_legend_html(), unsafe_allow_html=True)
+            # 달력 체크박스 클릭 → 숨겨진 버튼을 눌러 완료 상태를 바꿈 (표의 '완료' 열과 동기화)
+            for d in dated:
+                st.button("완료", key=f"caldone_{d['id']}", on_click=toggle_done, args=(d["id"],))
+            components.html(
+                "<script>const p = window.parent;"
+                "if (!p.__ableCb) { p.__ableCb = true;"
+                "p.document.addEventListener('click', function(e) {"
+                "const cb = e.target.closest ? e.target.closest('.able-cal .cb') : null;"
+                "if (!cb) return;"
+                "const btn = p.document.querySelector('.st-key-caldone_' + cb.dataset.id + ' button');"
+                "if (btn) btn.click(); }); }</script>", height=0)
 
     if undated:
-        st.warning("📌 날짜 미정: " + " / ".join(d["task"] for d in undated))
+        with undated_area:
+            st.markdown("<style>.st-key-undated_box{background:#FFF9DB;border-radius:8px;}"
+                        ".st-key-undated_box *{color:#333;}</style>", unsafe_allow_html=True)
+            with st.container(border=True, key="undated_box"):
+                st.markdown(f"##### ⚠️ 날짜 미정 일정 ({len(undated)}건)")
+                st.caption("날짜를 고르고 '날짜 지정'을 누르면 달력에 추가돼요.")
+                for d in undated:
+                    c_task, c_who, c_date, c_btn = st.columns([4, 1.5, 2, 1.5], vertical_alignment="center")
+                    c_task.markdown(f"**{d['task']}**")
+                    c_who.caption(f"👤 {d['assignee'] or '담당자 미정'}")
+                    key = f"undated_date_{d['id']}"
+                    c_date.date_input("날짜", value=today, key=key, label_visibility="collapsed")
+                    c_btn.button("📅 날짜 지정", key=f"undated_btn_{d['id']}", on_click=set_due_date,
+                                 args=(d["id"], key), use_container_width=True)
 
-    b1, b2 = st.columns(2)
-    b1.download_button("📥 캘린더 파일(.ics) 받기", data=make_ics(deadlines),
+    st.download_button("📥 캘린더 파일(.ics) 받기", data=make_ics(deadlines),
                        file_name="able_deadlines.ics", mime="text/calendar",
                        use_container_width=True, disabled=not dated)
-    if b2.button("🔄 업무 다시 추출", use_container_width=True):
-        st.session_state.analyze_request = "redo"   # 브리핑 없이 다시 추출
-        st.rerun()
     return deadlines
 
 # ---------------------------------------------------------------
@@ -1734,7 +1808,7 @@ defaults = {
     "priority_key": None,    # 마지막으로 분류한 회의록/날짜 식별값
     "messages": [],          # 화면용 대화 기록 (text / mail)
     "email_draft": None,     # 발송 전 확인 대기 중인 이메일 초안
-    "last_summary_id": None, # 대화에서 마지막으로 저장한 회의 요약 (PDF 보고서용)
+    "request_summary_ids": [],  # 이번 요청에서 저장한 회의 요약 id (답변 아래 PDF 버튼용)
     "draft_id": 0,
     "recorder_key": 0,       # 녹음 위젯 초기화용
     "last_audio_hash": None, # 이미 인식한 녹음 (중복 인식 방지)
@@ -1769,12 +1843,10 @@ with st.sidebar:
         except UnicodeDecodeError:
             text = raw.decode("cp949", errors="ignore")
         with st.expander(f"📄 {f.name}", expanded=len(meeting_files) == 1):
-                        # 우선순위: 파일명(제목)의 날짜 → 회의록 본문 앞부분의 날짜 → 오늘
-            guessed = guess_date_from_filename(f.name) or guess_meeting_date(text) or today_kst()
-            d = st.date_input("📆 회의 날짜", value=guessed,
+            d = st.date_input("📆 회의 날짜", value=guess_meeting_date(text) or today_kst(),
                               key=f"meeting_date_{i}_{f.name}",
-                              help="'다음 주 금요일' 같은 기한을 날짜로 바꿀 때 기준이 됩니다."
-                                   "파일 제목이나 회의록에 날짜가 적혀 있으면 자동으로 채워집니다.")
+                              help="'다음 주 금요일' 같은 기한을 날짜로 바꿀 때 기준이 됩니다. "
+                                   "회의록에 날짜가 적혀 있으면 자동으로 채워집니다.")
             st.text(text[:1500])
         meetings.append({"name": f.name, "text": text, "date": d})
     meetings.sort(key=lambda m: m["date"])   # 회의 날짜순
@@ -1803,7 +1875,7 @@ with st.sidebar:
     if st.button("🗑️ 대화 초기화", use_container_width=True):
         st.session_state.messages = []
         st.session_state.email_draft = None
-        st.session_state.last_summary_id = None
+        st.session_state.preview_summary_key = None
         st.session_state.last_audio_hash = None
         st.session_state.voice_text = None
         st.session_state.voice_audio = None
@@ -1849,7 +1921,6 @@ with tab_chat:
     # 대화창은 전체 너비. 이메일 초안은 대화창 안(맨 아래)에 카드로 들어가 함께 스크롤된다.
     chat_area = st.container(height=CHAT_HEIGHT, border=True)
     draft_area = chat_area
-    report_area = st.container()   # 방금 요약한 회의의 PDF 저장 / 미리보기
 
 
 # Shared input is outside tab containers, so it stays visible on every tab.
@@ -2048,6 +2119,7 @@ with chat_area:
 
             with st.spinner("답변 준비 중..."):
                 draft_before = st.session_state.draft_id
+                st.session_state.request_summary_ids = []
                 answer = ask_able(user_text, history, meeting_text, recipient)
 
                 # 새 이메일 초안이 만들어졌으면 초안 내용도 음성으로 함께 읽어 줌
@@ -2068,7 +2140,8 @@ with chat_area:
             # 음성 지시로 발송/취소된 경우 결과 줄을 먼저 표시
             for m in st.session_state.messages[n_before:]:
                 render_message(m)
-            answer_msg = add_message(role="assistant", content=answer, audio=audio)
+            answer_msg = add_message(role="assistant", content=answer, audio=audio,
+                                     summary_ids=list(dict.fromkeys(st.session_state.request_summary_ids)))
             finish_request()                # 답변까지 저장됐으므로 요청을 끝냄
             prune_audio()
             render_message(answer_msg, show_text or not audio, autoplay=True)
@@ -2087,25 +2160,6 @@ if st.session_state.deadline_changed:
     st.session_state.deadline_changed = False
     st.session_state.autoplay_last = True
     st.rerun()
-
-# ---------------------------------------------------------------
-# 방금 요약한 회의 → PDF 보고서 저장 / 미리보기
-# ---------------------------------------------------------------
-if st.session_state.last_summary_id is not None:
-    record = next((x for x in load_summaries() if x["id"] == st.session_state.last_summary_id), None)
-    if record:
-        with report_area:
-            # 저장 완료 안내는 전체 너비로, 그 아래에 버튼 2개를 나란히 둔다
-            st.success(f"📝 회의 요약을 저장했습니다: {record['meeting_date']} {record['title']}")
-            previewing = st.session_state.get("preview_summary_id") == record["id"]
-            c1, c2 = st.columns(2)
-            pdf_download_button(record, key="pdf_latest", container=c1)
-            c2.button("🙈 요약 보고서 닫기" if previewing else "👁️ 요약 보고서 미리보기",
-                      key="preview_latest", use_container_width=True,
-                      on_click=toggle_summary_preview, args=(record["id"],))
-            if previewing:
-                show_pdf_preview(record)
-
 
 # ---------------------------------------------------------------
 # 이메일 발송 전 확인 (사용자가 수정 후 발송 / 취소)
