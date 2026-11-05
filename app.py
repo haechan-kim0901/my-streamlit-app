@@ -1728,7 +1728,7 @@ with st.sidebar:
     with head_col:
         st.image(ABLE_HEAD, width=42)
     with title_col:
-        st.markdown("###회의록")
+        st.markdown("회의록")
     meeting_files = st.file_uploader("회의록(txt) 파일", type=["txt"], label_visibility="collapsed",
                                      accept_multiple_files=True)
     meetings = []   # [{"name", "text", "date"}] 회의록별 내용과 회의 날짜
