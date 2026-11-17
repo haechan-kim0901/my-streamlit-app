@@ -1,4 +1,14 @@
-
+# ════════════════════════════════════════════════════════
+# AIVLE School 학습 도우미 — 조별 통합본 (원본 UI + TOP3 추천 질문)
+# 베이스: 기능 승우+해찬 (화면 배치 그대로: 사이드바 추천 질문 · 오른쪽 히스토리,
+#         관리자 모드, 답변 근거 '📖 더보기', chroma_db 오류 시 재시도)
+# 반영:   [3차 수정] 관리자 모드 버튼을 누를 때마다 비밀번호 입력
+#         [5차 수정] 답변 본문의 근거 표시는 지우고 '더보기'에 쪽 번호만 표시
+# 추가:   [TOP3] 사이드바 추천 질문 = 많이 묻는 질문 TOP3
+#         - 같은 뜻 질문은 하나로 묶어서 셈 (유사도 0.80 이상 바로, 0.30~0.80은 GPT 확인)
+#         - 모든 사용자의 질문을 함께 세며, 앱이 재시작(Reboot)되면 0부터 다시 셈
+# 주석의 [TOP3] 표시로 추가된 부분을 찾을 수 있어요.
+# ════════════════════════════════════════════════════════
 # Streamlit Cloud의 sqlite 버전 문제 대비 (chromadb보다 먼저 실행돼야 함, Colab에서는 영향 없음)
 try:
     __import__("pysqlite3"); import sys; sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
@@ -13,6 +23,10 @@ import shutil      # [2차 수정 1] chroma_db 폴더를 지울 때 사용
 import tempfile
 import warnings
 from operator import itemgetter
+
+import math                      # [TOP3] 질문 유사도(코사인) 계산
+import threading                 # [TOP3] 여러 사용자가 동시에 질문해도 횟수가 꼬이지 않게 잠금
+from collections import Counter  # [TOP3] 질문 횟수 세기
 
 import streamlit as st
 
@@ -193,11 +207,211 @@ def rag_pipeline(filepath):
 LOGO_URL = "https://raw.githubusercontent.com/Jangrae/img/master/aivle.png"
 MODEL_NAME = LLM_MODEL       # 하단 안내 문구용 (위 설정값을 그대로 사용)
 ADMIN_PASSWORD = "0207"      # [수정 1] 관리자 모드 비밀번호 (바꾸려면 여기만 수정)
-SUGGESTED = [
+
+# ════════════════════════════════════════════════════════
+# [TOP3] 추천 질문(많이 묻는 질문 TOP3) 기능
+# ════════════════════════════════════════════════════════
+# 왼쪽 사이드바 '추천 질문' 3개에 사람들이 많이 물어본 질문을 보여 줍니다.
+#   ① 새 질문을 임베딩(뜻을 숫자 목록으로 바꾼 것)으로 변환
+#   ② 이미 기록된 질문 묶음들과 유사도를 비교
+#   ③ 유사도가 SIMILAR_THRESHOLD 이상이면 같은 질문(+1),
+#      MAYBE_THRESHOLD~SIMILAR 사이면 GPT에게 확인, 그보다 낮으면 새 묶음으로 등록
+#      (처음 들어온 질문이 카드에 보일 대표 문장)
+# ※ 모든 사용자의 질문을 함께 세며, 앱이 재시작되면 0부터 다시 셉니다.
+
+# [TOP3] 기본 추천 질문: 질문 기록이 3개가 안 될 때 빈 카드를 채움
+DEFAULT_SUGGESTED = [
     "비전공자도 따라갈 수 있나요?",
     "교육비와 자기부담금은 얼마인가요?",
     "미니 프로젝트는 어떻게 진행되나요?",
 ]
+TOP_N = 3                    # [TOP3] 추천 질문 카드 개수
+
+# [TOP3 개선] 같은 질문인지 판단하는 기준을 2단계로 나눔
+# 유사도(0~1)는 1에 가까울수록 뜻이 비슷하다는 뜻입니다.
+#   · SIMILAR_THRESHOLD 이상           → 확실히 같은 질문 (바로 +1)
+#   · MAYBE_THRESHOLD ~ SIMILAR 사이   → 애매함 → GPT에게 "같은 질문인가요?" 물어서 결정
+#   · MAYBE_THRESHOLD 미만             → 다른 질문 (새 카드)
+# 예) "트랙이 어떻게 되나요?" ↔ "어떤 트랙이 있나요?"는 뜻은 같지만
+#     표현이 달라 유사도가 0.80보다 낮게 나옴 → 애매 구간에서 GPT가 '같음'으로 판단
+SIMILAR_THRESHOLD = 0.80     # 이 값 이상이면 무조건 같은 질문
+# [TOP3 개선3] 0.50 → 0.30으로 낮춤
+# - 실제 테스트: "어떤 트랙이 있어?" ↔ "트랙이 어떻게 돼?" 유사도가 0.398로 나옴
+#   (짧은 반말 질문은 뜻이 같아도 유사도가 낮게 나옴) → 0.50이면 GPT 확인까지 못 감
+# - 낮춰도 최종 판단은 GPT가 하므로, 다른 질문이 잘못 묶일 가능성은 낮음
+MAYBE_THRESHOLD   = 0.30     # 이 값 이상이면 GPT에게 한 번 더 확인
+
+# [TOP3] 질문 기록 저장소
+# st.session_state는 사용자마다 따로지만, st.cache_resource는 '모든 사용자'가 함께 씀
+@st.cache_resource
+def get_question_stats():
+    return {
+        "counts": Counter(),   # {묶음 번호: 횟수}
+        "texts": {},           # {묶음 번호: 카드에 보여줄 대표 문장}
+        "norms": {},           # {묶음 번호: 정리된 대표 문장} → 완전히 같은 질문은 임베딩 없이 찾기
+        "vecs": {},            # [TOP3 개선] {묶음 번호: [묶음에 들어온 질문들의 임베딩 목록]}
+                               #  → 대표 문장 하나가 아니라 묶음의 모든 표현과 비교해서 더 잘 묶임
+        "lock": threading.Lock(),
+    }
+
+
+# [TOP3] 질문 임베딩용 모델 (RAG와 같은 모델, 모든 사용자가 하나를 공유)
+@st.cache_resource
+def get_question_embedder():
+    return OpenAIEmbeddings(model=EMBEDDING_MODEL)
+
+
+def normalize_question(q):
+    """[TOP3] 띄어쓰기·끝의 물음표 차이로 같은 질문이 따로 세지지 않도록 정리"""
+    q = " ".join(q.split())             # 여러 칸 띄어쓰기 → 한 칸
+    return q.rstrip("?？.!~ ").strip()
+
+
+def cosine_similarity(a, b):
+    """[TOP3] 두 임베딩이 얼마나 비슷한지 계산 (1에 가까울수록 같은 뜻)"""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
+    return dot / norm if norm else 0.0
+
+
+def embed_question(text):
+    """[TOP3] 질문 → 임베딩. 실패하면 None (앱이 멈추지 않게)"""
+    try:
+        return get_question_embedder().embed_query(text)
+    except Exception:
+        return None
+
+
+def find_best_group(vec, groups):
+    """[TOP3 개선] 가장 비슷한 묶음 번호와 그 유사도를 함께 돌려줌: (묶음 번호, 유사도)
+    - 묶음 안에 들어온 '모든 질문'과 비교해서 가장 높은 점수를 그 묶음의 점수로 씀
+    - 기록이 하나도 없으면 (None, 0.0)
+    """
+    best_id, best_score = None, 0.0
+    for gid, gvecs in groups.items():
+        for gvec in gvecs:
+            score = cosine_similarity(vec, gvec)
+            if score > best_score:
+                best_id, best_score = gid, score
+    return best_id, best_score
+
+
+# [TOP3 개선] 애매한 경우 같은 질문인지 판단할 GPT (답변용 모델과 같은 모델, 모든 사용자 공유)
+@st.cache_resource
+def get_judge_llm():
+    return ChatOpenAI(model=LLM_MODEL, temperature=0)
+
+
+def is_same_question(q1, q2):
+    """[TOP3 개선2] GPT에게 두 질문이 같은 내용을 묻는지 확인 → (같은지 여부, GPT 원래 대답)
+    - 유사도가 애매한 구간(MAYBE ~ SIMILAR)일 때만 호출되므로 호출 횟수는 적음
+    - 문제였던 점: '예/아니오'로 물으면 GPT가 "네", "'예'"처럼 답해서 같은 질문인데도 False가 됨
+      → 헷갈리지 않게 영어 단어 SAME / DIFFERENT 중 하나로만 답하게 바꿈
+    - 호출에 실패하면 False(다른 질문)로 처리해 앱이 멈추지 않게 함
+    """
+    judge_prompt = (
+        "다음 두 질문이 묻는 내용(의도)이 같은지 판단하세요.\n"
+        "말투, 어미(~요/~어), 어순, 단어 표현만 다르고 알고 싶은 정보가 같으면 같은 질문입니다.\n"
+        "같으면 SAME, 다르면 DIFFERENT 한 단어로만 답하세요.\n"
+        f"질문1: {q1}\n질문2: {q2}"
+    )
+    try:
+        reply = get_judge_llm().invoke(judge_prompt).content.strip()
+        return reply.upper().startswith("SAME"), reply
+    except Exception as e:
+        return False, f"오류: {e}"
+
+
+def record_question(question, answer):
+    """[TOP3] 답변을 받은 질문을 횟수에 더하기 (같은 뜻 질문은 하나로 묶어서 셈)
+    - 백서에 없는 질문이나 오류 답변은 추천하면 안 되므로 세지 않음
+    """
+    if NOT_FOUND_MSG in answer or answer.startswith("오류가 발생했어요"):
+        return
+    key = normalize_question(question)
+    if not key:
+        return
+    stats = get_question_stats()
+
+    # ① 글자까지 완전히 같은 질문이 있으면 → 임베딩 없이 바로 +1 (API 호출 절약)
+    with stats["lock"]:
+        for gid, norm in stats["norms"].items():
+            if norm == key:
+                stats["counts"][gid] += 1
+                return
+        groups = {g: list(v) for g, v in stats["vecs"].items()}   # [TOP3 개선] 비교용 복사본 (임베딩 목록까지 복사)
+
+    # ② [TOP3 개선] 임베딩으로 가장 비슷한 묶음과 유사도 찾기
+    vec = embed_question(key)
+    gid = None
+    debug = "임베딩 실패 (글자 비교로만 셈)" if vec is None else "비교할 기록 없음 → 새 질문"   # [TOP3 개선2] 판단 과정 기록
+    if vec is not None:
+        best_id, score = find_best_group(vec, groups)
+        if best_id is not None:
+            with stats["lock"]:
+                rep_text = stats["texts"][best_id]          # 가장 비슷한 묶음의 대표 문장
+            debug = f"가장 비슷한 질문: '{rep_text}' / 유사도 {score:.3f}"
+        if score >= SIMILAR_THRESHOLD:
+            gid = best_id                                   # 확실히 같은 질문
+            debug += " → 기준 이상, 같은 질문"
+        elif score >= MAYBE_THRESHOLD:
+            same, reply = is_same_question(question, rep_text)   # 애매 → GPT에게 확인
+            debug += f" → GPT 판정: {reply}"
+            if same:
+                gid = best_id
+        elif best_id is not None:
+            debug += f" → {MAYBE_THRESHOLD} 미만, 다른 질문"
+    ss["top3_debug"] = f"[{question}] {debug}"   # [TOP3 개선2] 관리자 화면에 보여 줄 마지막 판단 결과
+
+    with stats["lock"]:
+        if gid is not None:
+            # ③-1 같은 질문 묶음 → 횟수 +1, 이 표현도 묶음에 추가 (다음 비교에 활용)
+            stats["counts"][gid] += 1
+            stats["vecs"][gid].append(vec)
+        else:
+            # ③-2 처음 보는 질문 → 새 묶음 등록 (이 질문이 카드에 보일 대표 문장)
+            new_id = len(stats["texts"])
+            stats["counts"][new_id] = 1
+            stats["texts"][new_id] = question.strip()
+            stats["norms"][new_id] = key
+            stats["vecs"][new_id] = [vec] if vec is not None else []
+
+
+# [TOP3] 기본 추천 질문의 임베딩 (처음 필요할 때 한 번만 계산)
+@st.cache_resource
+def get_default_vecs():
+    return {q: embed_question(normalize_question(q)) for q in DEFAULT_SUGGESTED}
+
+
+def get_top_questions(n=TOP_N):
+    """[TOP3] 많이 물은 순서로 n개 반환: [(질문, 횟수), ...]
+    - 기록이 부족하면 DEFAULT_SUGGESTED로 채움 (이때 횟수는 None)
+    - 이미 카드에 있는 질문과 뜻이 같은 기본 질문은 건너뜀 (카드 중복 방지)
+    """
+    stats = get_question_stats()
+    with stats["lock"]:
+        top_ids = [gid for gid, _ in stats["counts"].most_common(n)]
+        top = [(stats["texts"][g], stats["counts"][g]) for g in top_ids]
+        top_norms = {stats["norms"][g] for g in top_ids}
+        top_vecs = {g: stats["vecs"][g] for g in top_ids if g in stats["vecs"]}
+
+    if len(top) >= n:
+        return top
+
+    default_vecs = get_default_vecs() if top_vecs else {}
+    for q in DEFAULT_SUGGESTED:
+        if len(top) >= n:
+            break
+        if normalize_question(q) in top_norms:
+            continue
+        dvec = default_vecs.get(q)
+        # [TOP3 개선] find_best_group으로 바뀜 (화면을 그릴 때마다 GPT를 부르지 않도록
+        #             여기서는 '확실히 같은 질문(SIMILAR_THRESHOLD 이상)'만 건너뜀)
+        if dvec is not None and find_best_group(dvec, top_vecs)[1] >= SIMILAR_THRESHOLD:
+            continue   # 이미 카드에 있는 질문과 같은 뜻 → 건너뜀
+        top.append((q, None))
+    return top
+
 
 # ── 세션 상태 ───────────────────────────────────────────
 # Streamlit은 입력할 때마다 파일 전체를 다시 실행하므로
@@ -420,11 +634,22 @@ with st.sidebar:
         new_chat()
         st.rerun()
 
-    st.caption("추천 질문")
-    for i, q in enumerate(SUGGESTED):
-        if st.button(f"💡  {q}", key=f"nav_q{i}", width="stretch", type="tertiary",
-                     disabled=ss.rag_chain is None):
+    # [TOP3] 추천 질문 = 많이 묻는 질문 TOP3 (원본 위치·모양 그대로, 내용만 자동으로 바뀜)
+    # - 실제로 물어본 질문: 🔥 아이콘 (마우스를 올리면 질문 횟수 표시)
+    # - 기록이 부족해 채운 기본 질문: 💡 아이콘
+    # - 누르면 그 질문이 바로 채팅으로 들어감 (pending_question)
+    st.caption("추천 질문 · 많이 묻는 질문 TOP3")
+    for i, (q, cnt) in enumerate(get_top_questions()):
+        icon = "🔥" if cnt else "💡"
+        tip = f"{cnt}회 질문됨" if cnt else "기본 추천 질문"
+        if st.button(f"{icon}  {q}", key=f"nav_q{i}", width="stretch", type="tertiary",
+                     help=tip, disabled=ss.rag_chain is None):
             ss.pending_question = q
+
+    # [TOP3] 관리자 확인용: 마지막 질문이 어떻게 판단됐는지 표시
+    # (관리자 모드로 로그인한 사람에게만 보임 → 시연 화면에는 안 나옴)
+    if ss.is_admin and ss.get("top3_debug"):
+        st.caption(f"🔧 {ss.top3_debug}")
 
     doc = ss.file_name or "아직 문서가 없어요"
     st.markdown(
@@ -536,4 +761,7 @@ with chat_col:
                 "content": result["answer"],
                 "sources": result["sources"],
             })
-            st.rerun()   # 히스토리 제목·미리보기를 바로 갱신
+            # [TOP3] 이 질문을 추천 질문 TOP3 집계에 반영
+            # (ask()가 {"answer", "sources"}를 돌려주므로 답변 글자인 result["answer"]를 넘김)
+            record_question(question, result["answer"])
+            st.rerun()   # 히스토리 제목·미리보기·추천 질문 TOP3를 바로 갱신
