@@ -661,7 +661,7 @@ with st.sidebar:
     # [6차 수정 4] 적용된 문서 카드 오른쪽에 다운로드 버튼 추가
     #  (문서가 적용된 뒤에만 버튼이 보임)
     with st.container(key="doc_card"):
-        d1, d2 = st.columns([5, 1], gap="small", vertical_alignment="center")
+        d1, d2 = st.columns([5, 1], gap="small", vertical_alignment="bottom")
         d1.markdown(
             f'<div class="doc-card"><div class="label">적용된 문서</div>📄 {doc}</div>',
             unsafe_allow_html=True,
