@@ -322,7 +322,6 @@ def find_topics(question):
 def record_question(question, answer):
     """[주제별 TOP3] 답변을 받은 질문을 주제별 횟수에 더하기
     - 백서에 없는 질문이나 오류 답변은 추천하면 안 되므로 세지 않음
-    - 판단 결과는 관리자 화면(🔧)에 보여 주려고 top3_debug에 기록
     """
     if NOT_FOUND_MSG in answer or answer.startswith("오류가 발생했어요"):
         ss["top3_debug"] = f"[{question}] → 백서에 없는 질문/오류라서 세지 않음"
@@ -807,8 +806,7 @@ with st.sidebar:
 
     # [주제별 TOP3] 관리자 확인용: 마지막 질문이 어느 주제로 세졌는지 표시
     # (관리자 모드로 로그인한 사람에게만 보임 → 시연 화면에는 안 나옴)
-    if ss.is_admin and ss.get("top3_debug"):
-        st.caption(f"🔧 {ss.top3_debug}")
+  
 
     doc = ss.file_name or "아직 문서가 없어요"
     with st.container(key="doc_card"):
