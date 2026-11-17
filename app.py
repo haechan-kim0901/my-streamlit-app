@@ -6,7 +6,7 @@ except ImportError:
     pass
 
 import os
-import re          # [4차 수정 1] 소제목(마크다운 # 제목)을 찾을 때 사용
+import re          # [5차 수정 1] 답변에서 "(근거: p.5)" 부분을 찾을 때 사용
 import uuid
 import hashlib
 import shutil      # [2차 수정 1] chroma_db 폴더를 지울 때 사용
@@ -94,38 +94,25 @@ def format_docs(docs):
     return "\n\n---\n\n".join(blocks)
 
 
-# [4차 수정 2] 각 문단이 속한 소제목을 찾아 metadata["section"]에 적어 두는 함수 (새로 추가)
-#  - PyMuPDF4LLM이 제목을 "## 제목"처럼 바꿔 주므로, 문단 시작 위치보다 앞에 있는
-#    가장 가까운 제목을 그 문단의 소제목으로 봄
-#  - 그 쪽에 제목이 없으면 앞쪽에서 마지막으로 나온 제목을 이어서 사용
-HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+# [5차 수정 2] 답변 끝의 "(근거: p.3, p.5)"를 본문에서 떼어 내는 함수 (새로 추가)
+#  - 본문에서는 근거 표시를 지우고, 적혀 있던 쪽 번호만 따로 돌려줌
+#  - 돌려준 쪽 번호는 "더보기"에서만 보여 줌
+SOURCE_RE = re.compile(
+    r"[ \t]*[(\[（][ \t]*근거[ \t]*[:：]([^)\]）]*)[)\]）]"    # (근거: p.3, p.5)
+    r"|^[ \t]*근거[ \t]*[:：](.*)$",                             # 괄호 없이 줄 전체가 "근거: p.3"
+    re.MULTILINE,
+)
 
 
-def add_section_titles(docs, splits):
-    headings = {}   # {쪽: [(위치, 제목), ...]}
-    carried = {}    # {쪽: 앞쪽에서 이어지는 제목}
-    last_title = ""
-    for d in docs:
-        page = d.metadata.get("page")
-        carried[page] = last_title
-        found = []
-        for m in HEADING_RE.finditer(d.page_content):
-            title = re.sub(r"[*_`#]", "", m.group(1)).strip()   # 굵게 표시 등 기호 제거
-            if title:
-                found.append((m.start(), title))
-        headings[page] = found
-        if found:
-            last_title = found[-1][1]
-
-    for s in splits:
-        page = s.metadata.get("page")
-        start = max(s.metadata.get("start_index", 0), 0)
-        title = carried.get(page, "")
-        for pos, t in headings.get(page, []):
-            if pos > start:
-                break
-            title = t
-        s.metadata["section"] = title
+def split_answer_and_pages(answer):
+    pages = []
+    for m in SOURCE_RE.finditer(answer):
+        for num in re.findall(r"p\.?\s*(\d+)", m.group(1) or m.group(2) or ""):
+            label = f"p.{num}"
+            if label not in pages:
+                pages.append(label)
+    body = SOURCE_RE.sub("", answer).strip()
+    return body, pages
 
 
 # RAG 파이프라인 함수 (01번 노트북의 rag_pipeline 그대로)
@@ -140,10 +127,8 @@ def rag_pipeline(filepath):
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         separators=["\n## ", "\n### ", "\n#### ", "\n\n", "\n", ". ", " ", ""],
-        add_start_index=True,   # [4차 수정 3] 문단이 쪽 안에서 시작하는 위치를 기록
     )
     splits = text_splitter.split_documents(docs)
-    add_section_titles(docs, splits)   # [4차 수정 3] 문단마다 소제목 기록
 
     # Embedding 모델
     embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
@@ -180,15 +165,20 @@ def rag_pipeline(filepath):
             "input": question,
             "context": format_docs(retrieved_docs),
         })
-        sources = []
-        for doc in retrieved_docs[:3]:  # 수정: 간결한 화면을 위해 최대 3개
-            page = doc.metadata.get("page")
-            label = f"p.{page + 1}" if isinstance(page, int) else "페이지 정보 없음"
-            sources.append({
-                "page": label,
-                "section": doc.metadata.get("section", ""),   # [4차 수정 4] 소제목도 함께 반환
-                "content": doc.page_content.strip(),
-            })
+        # [5차 수정 3] 답변 본문에서 "(근거: ...)"를 지우고, 그 쪽 번호를 근거로 사용
+        answer, pages = split_answer_and_pages(answer)
+
+        if NOT_FOUND_MSG in answer:
+            pages = []   # 백서에 없는 내용이면 근거를 표시하지 않음
+        elif not pages:
+            # 답변에 쪽 번호가 없으면 기존처럼 검색된 문단(최대 3개)의 쪽 번호를 사용
+            for doc in retrieved_docs[:3]:
+                page = doc.metadata.get("page")
+                label = f"p.{page + 1}" if isinstance(page, int) else "페이지 정보 없음"
+                if label not in pages:
+                    pages.append(label)
+
+        sources = [{"page": p} for p in pages]
         return {"answer": answer, "sources": sources}
 
     rag_chain = RunnableLambda(answer_with_sources)  # 수정: 기존 변수명 유지
@@ -327,32 +317,17 @@ def show_sources(sources):
     if not sources:
         return
 
-    # 수정: 페이지 번호와 위치만 간결하게 출력
+    # [5차 수정 4] 소제목(위치 안내) 없이 쪽 번호만 한 줄로 출력
     with st.expander("📖 더보기", expanded=False):
         st.caption("답변 생성 시 제공된 백서 참고 위치")
 
-        shown = set()
-        for i, source in enumerate(sources[:3], start=1):
+        pages = []
+        for source in sources:
             page = source.get("page", "쪽 번호 없음")
-            content = source.get("content", "").strip()
+            if page not in pages:
+                pages.append(page)
 
-            # [4차 수정 5] 쪽 번호 옆에 소제목을 표시
-            #  (소제목을 찾지 못한 문단만 기존처럼 첫 줄을 대신 표시)
-            location = source.get("section", "")
-            if not location:
-                lines = [
-                    line.strip().lstrip("#").strip()
-                    for line in content.splitlines()
-                    if line.strip()
-                ]
-                location = lines[0][:65] if lines else "위치 정보 없음"
-
-            # [4차 수정 5] 쪽 번호와 소제목이 같은 근거는 한 번만 표시
-            if (page, location) in shown:
-                continue
-            shown.add((page, location))
-
-            st.markdown(f"**{page}** · {location}")
+        st.markdown(", ".join(f"**{p}**" for p in pages))
 
 
 # ── 스타일 ──────────────────────────────────────────────
