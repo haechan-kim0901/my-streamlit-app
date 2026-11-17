@@ -569,7 +569,7 @@ st.markdown(f"""
 /* 사이드바 하단 문서 카드 */
 /* [6차 수정 3] 카드 테두리를 바깥 상자(.st-key-doc_card)로 옮김 → 다운로드 버튼도 카드 안에 들어감 */
 .st-key-doc_card {{
-    margin-top: 1.5rem; padding: 12px 14px; border: 1px solid rgba(0,0,0,0.1);
+    margin-top: 1.5rem; padding: 12px 14px 28px; border: 1px solid rgba(0,0,0,0.1);
     border-radius: 12px;
 }}
 .doc-card {{ font-size: 0.85rem; line-height: 1.4; word-break: break-all; }}
