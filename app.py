@@ -675,7 +675,7 @@ st.markdown(f"""
 [data-testid="stSidebar"] .st-key-nav_admin {{ position: fixed; bottom: 1.2rem; }}
 
 /* 사이드바 하단 문서 카드 */
-.st-key-doc_download {{ position: relative; top: 10px; }}
+.st-key-doc_download {{ position: relative; top: 14px; }}
 .st-key-doc_card {{
     margin-top: 1.5rem; padding: 12px 14px 28px; border: 1px solid rgba(0,0,0,0.1);
     border-radius: 12px;
