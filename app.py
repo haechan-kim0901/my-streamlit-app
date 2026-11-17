@@ -412,7 +412,7 @@ with hist_col:
 
 # 가운데: 대화 영역 + 다시 생성 + 입력창
 with chat_col:
-    chat_box = st.container(height=470, border=False)
+    chat_box = st.container(height=700, border=False)
 
     # 다시 생성: 마지막 질문으로 답변을 새로 받기
     regenerate = False
