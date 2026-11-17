@@ -364,6 +364,7 @@ ss = st.session_state
 ss.setdefault("rag_chain", None)
 ss.setdefault("file_hash", None)
 ss.setdefault("file_name", None)
+ss.setdefault("file_data", None)
 ss.setdefault("chats", {})        # {대화ID: {"title": 제목, "messages": [...]}}
 ss.setdefault("current_id", None)
 ss.setdefault("is_admin", False)  # [수정 2] 관리자 인증 여부 (비밀번호를 맞히면 True)
@@ -424,6 +425,7 @@ def build_chain(uploaded_file):
                 ss.rag_chain = rag_pipeline(tmp_path)
         ss.file_hash = file_hash
         ss.file_name = uploaded_file.name
+        ss.file_data = data
     finally:
         os.remove(tmp_path)
 
@@ -673,11 +675,14 @@ st.markdown(f"""
 [data-testid="stSidebar"] .st-key-nav_admin {{ position: fixed; bottom: 1.2rem; }}
 
 /* 사이드바 하단 문서 카드 */
-.doc-card {{
+.st-key-doc_card {{
     margin-top: 1.5rem; padding: 12px 14px; border: 1px solid rgba(0,0,0,0.1);
-    border-radius: 12px; font-size: 0.85rem; line-height: 1.4;
+    border-radius: 12px;
 }}
+.doc-card {{ font-size: 0.85rem; line-height: 1.4; word-break: break-all; }}
 .doc-card .label {{ color: #888; font-size: 0.75rem; }}
+.st-key-doc_download button {{ padding: 2px 8px; min-height: 0; font-size: 1.1rem; color: #555; }}
+.st-key-doc_download button:hover {{ background-color: rgba(0,0,0,0.06); color: #111; }}
 
 /* ★ [답변 평가] 히스토리 카드의 만족/불만족 태그 */
 .rate-tag {{
@@ -806,10 +811,18 @@ with st.sidebar:
         st.caption(f"🔧 {ss.top3_debug}")
 
     doc = ss.file_name or "아직 문서가 없어요"
-    st.markdown(
-        f'<div class="doc-card"><div class="label">적용된 문서</div>📄 {doc}</div>',
-        unsafe_allow_html=True,
-    )
+    with st.container(key="doc_card"):
+        d1, d2 = st.columns([5, 1], gap="small", vertical_alignment="center")
+        d1.markdown(
+            f'<div class="doc-card"><div class="label">적용된 문서</div>📄 {doc}</div>',
+            unsafe_allow_html=True,
+        )
+        if ss.file_data is not None:
+            d2.download_button(
+                "⬇", data=ss.file_data, file_name=ss.file_name, mime="application/pdf",
+                key="doc_download", help="백서 PDF 다운로드", type="tertiary",
+                on_click="ignore",   # 눌러도 화면을 다시 그리지 않고 파일만 내려받음
+            )
 
     # [수정 5] 관리자 모드 버튼 (누르면 비밀번호 팝업이 열림)
     if st.button("관리자 모드  →", key="nav_admin", type="tertiary"):
