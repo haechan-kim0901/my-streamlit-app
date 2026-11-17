@@ -1,3 +1,4 @@
+
 # Streamlit Cloud의 sqlite 버전 문제 대비 (chromadb보다 먼저 실행돼야 함, Colab에서는 영향 없음)
 try:
     __import__("pysqlite3"); import sys; sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
@@ -22,6 +23,7 @@ pymupdf.set_messages(path=os.devnull)
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda  # 수정: 검색 문단과 답변을 함께 반환
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
@@ -131,16 +133,24 @@ def rag_pipeline(filepath):
     # LLM 선언
     llm = ChatOpenAI(model=LLM_MODEL, temperature=TEMPERATURE)
 
-    # RAG 체인 구성
-    rag_chain = (
-        {
-            "context": itemgetter("input") | retriever | format_docs,
-            "input": itemgetter("input"),
-        }
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+    # 수정: 검색 문서를 한 번만 가져와 답변과 근거 문단을 함께 반환
+    answer_chain = prompt | llm | StrOutputParser()
+
+    def answer_with_sources(payload):
+        question = payload["input"]
+        retrieved_docs = retriever.invoke(question)
+        answer = answer_chain.invoke({
+            "input": question,
+            "context": format_docs(retrieved_docs),
+        })
+        sources = []
+        for doc in retrieved_docs[:3]:  # 수정: 간결한 화면을 위해 최대 3개
+            page = doc.metadata.get("page")
+            label = f"p.{page + 1}" if isinstance(page, int) else "페이지 정보 없음"
+            sources.append({"page": label, "content": doc.page_content.strip()})
+        return {"answer": answer, "sources": sources}
+
+    rag_chain = RunnableLambda(answer_with_sources)  # 수정: 기존 변수명 유지
 
     return rag_chain
 
@@ -266,7 +276,33 @@ def ask(question):
     try:
         return ss.rag_chain.invoke({"input": question})
     except Exception as e:
-        return f"오류가 발생했어요: {e}"
+        # 수정: 오류 상황에도 답변과 근거의 반환 구조를 일정하게 유지
+        return {"answer": f"오류가 발생했어요: {e}", "sources": []}
+
+
+# 수정: AI 답변 아래 원본 검색 문단을 접이식으로 표시
+# 실제로 검색된 문단이며, AI가 모든 문단을 사용했다는 의미는 아님
+def show_sources(sources):
+    if not sources:
+        return
+
+    # 수정: 페이지 번호와 위치만 간결하게 출력
+    with st.expander("📖 더보기", expanded=False):
+        st.caption("답변 생성 시 제공된 백서 참고 위치")
+
+        for i, source in enumerate(sources[:3], start=1):
+            page = source.get("page", "쪽 번호 없음")
+            content = source.get("content", "").strip()
+
+            # 수정: 첫 번째 의미 있는 줄을 위치 안내로 표시
+            lines = [
+                line.strip().lstrip("#").strip()
+                for line in content.splitlines()
+                if line.strip()
+            ]
+            location = lines[0][:65] if lines else "위치 정보 없음"
+
+            st.markdown(f"**{page}** · {location}")
 
 
 # ── 스타일 ──────────────────────────────────────────────
@@ -373,8 +409,6 @@ with st.sidebar:
 
     # [수정 5] 관리자 모드 버튼 (누르면 비밀번호 팝업이 열림)
     if st.button("관리자 모드  →", key="nav_admin", type="tertiary"):
-        # [3차 수정 1] 버튼을 누를 때마다 인증을 초기화 → 매번 비밀번호를 다시 입력해야 함
-        ss.is_admin = False
         admin_dialog()
 
 current = ss.chats[ss.current_id]
@@ -414,7 +448,7 @@ with hist_col:
 
 # 가운데: 대화 영역 + 다시 생성 + 입력창
 with chat_col:
-    chat_box = st.container(height=730, border=False)
+    chat_box = st.container(height=470, border=False)
 
     # 다시 생성: 마지막 질문으로 답변을 새로 받기
     regenerate = False
@@ -441,6 +475,7 @@ with chat_col:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
                 if msg["role"] == "assistant":
+                    show_sources(msg.get("sources", []))  # 수정: 이전 답변의 근거 유지
                     st.feedback("thumbs", key=f"fb_{ss.current_id}_{idx}")
 
         if regenerate:
@@ -448,7 +483,9 @@ with chat_col:
             with st.spinner("답변을 다시 만드는 중..."):
                 new_answer = ask(last_q)
             if current["messages"][-1]["role"] == "assistant":
-                current["messages"][-1]["content"] = new_answer
+                # 수정: 다시 생성할 때 답변과 근거 모두 갱신
+                current["messages"][-1]["content"] = new_answer["answer"]
+                current["messages"][-1]["sources"] = new_answer["sources"]
             st.rerun()
 
         if question:
@@ -462,8 +499,14 @@ with chat_col:
 
             with st.chat_message("assistant"):
                 with st.spinner("답변을 찾는 중..."):
-                    answer = ask(question)
-                st.markdown(answer)
+                    result = ask(question)  # 수정: 답변 + 근거 반환
+                st.markdown(result["answer"])  # 수정: 답변 출력
+                show_sources(result["sources"])  # 수정: 접이식 근거 표시
 
-            current["messages"].append({"role": "assistant", "content": answer})
+            # 수정: 히스토리에 답변과 원본 검색 문단 함께 저장
+            current["messages"].append({
+                "role": "assistant",
+                "content": result["answer"],
+                "sources": result["sources"],
+            })
             st.rerun()   # 히스토리 제목·미리보기를 바로 갱신
