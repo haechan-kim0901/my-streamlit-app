@@ -128,6 +128,3 @@ def rag_pipeline(filepath):
     )
 
     return rag_chain
-
-# RAG 체인 선언
-rag_chain = rag_pipeline(path+"AIVLE School 백서.pdf")
