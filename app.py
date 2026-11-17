@@ -150,6 +150,7 @@ def rag_pipeline(filepath):
 
 LOGO_URL = "https://raw.githubusercontent.com/Jangrae/img/master/aivle.png"
 MODEL_NAME = LLM_MODEL       # 하단 안내 문구용 (위 설정값을 그대로 사용)
+ADMIN_PASSWORD = "0207"      # [수정 1] 관리자 모드 비밀번호 (바꾸려면 여기만 수정)
 SUGGESTED = [
     "비전공자도 따라갈 수 있나요?",
     "교육비와 자기부담금은 얼마인가요?",
@@ -165,6 +166,7 @@ ss.setdefault("file_hash", None)
 ss.setdefault("file_name", None)
 ss.setdefault("chats", {})        # {대화ID: {"title": 제목, "messages": [...]}}
 ss.setdefault("current_id", None)
+ss.setdefault("is_admin", False)  # [수정 2] 관리자 인증 여부 (비밀번호를 맞히면 True)
 
 
 def new_chat():
@@ -206,6 +208,31 @@ def build_chain(uploaded_file):
     finally:
         os.remove(tmp_path)
 
+# ── [수정 3] 관리자 모드 팝업 (새로 추가) ────────────────
+# 1단계: 비밀번호 입력 → 2단계: 맞으면 같은 팝업이 문서 업로드 화면으로 바뀜
+@st.dialog("관리자 모드")
+def admin_dialog():
+    # 1단계: 아직 인증 전이면 비밀번호 입력 폼을 보여 줌
+    if not ss.is_admin:
+        slot = st.empty()   # 인증에 성공하면 이 자리(입력 폼)를 지움
+        with slot.form("admin_login", border=False):
+            pw = st.text_input("비밀번호를 입력하세요", type="password")
+            submitted = st.form_submit_button("확인", width="stretch")
+        if submitted:
+            if pw == ADMIN_PASSWORD:
+                ss.is_admin = True
+                slot.empty()
+            else:
+                st.error("비밀번호가 올바르지 않아요.")
+
+    # 2단계: 인증된 관리자에게만 업로드 화면을 보여 줌 (기존 📎 파일 업로드를 여기로 옮김)
+    if ss.is_admin:
+        st.caption("백서 PDF를 올리면 그 내용을 바탕으로 답해요.")
+        uploaded = st.file_uploader("AIVLE School 백서(PDF)", type="pdf")
+        if uploaded is not None:
+            build_chain(uploaded)
+            st.rerun()   # 팝업을 닫고 화면 전체를 새로 그림 (배지·입력창 활성화)
+
 
 def ask(question):
     try:
@@ -230,6 +257,9 @@ st.markdown(f"""
 [class*="st-key-nav_"] button:hover {{ background-color: rgba(0,0,0,0.06); color: inherit; }}
 [data-testid="stSidebar"] [class*="st-key-nav_q"] {{ margin-top: -0.7rem; }}
 .st-key-nav_new button {{ background-color: rgba(0,0,0,0.06); font-weight: 600; }}
+
+/* [수정 4] 관리자 모드 버튼: 사이드바 맨 아래에 고정 */
+[data-testid="stSidebar"] .st-key-nav_admin {{ position: fixed; bottom: 1.2rem; }}
 
 /* 사이드바 하단 문서 카드 */
 .doc-card {{
@@ -313,6 +343,10 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+# [수정 5] 관리자 모드 버튼 (누르면 비밀번호 팝업이 열림)
+    if st.button("관리자 모드  →", key="nav_admin", type="tertiary"):
+        admin_dialog()
+
 current = ss.chats[ss.current_id]
 
 # ── 상단 바 ─────────────────────────────────────────────
@@ -361,14 +395,8 @@ with chat_col:
     with st.container(border=True):
         user_input = st.chat_input("메시지를 입력하세요", max_chars=3000,
                                    disabled=ss.rag_chain is None)
-        a1, a2 = st.columns([1, 3], vertical_alignment="center")
-        with a1:
-            with st.popover("📎 파일 업로드", width="stretch"):
-                uploaded = st.file_uploader("AIVLE School 백서(PDF)", type="pdf")
-                if uploaded is not None:
-                    build_chain(uploaded)
-                    st.success("적용 완료")
-        a2.caption("백서 PDF를 올리면 그 내용을 바탕으로 답해요.")
+        # [수정 6] 여기 있던 "📎 파일 업로드" 버튼을 삭제 (업로드는 관리자 모드 팝업에서만 가능)
+        st.caption("관리자가 적용한 백서 내용을 바탕으로 답해요.")
 
     st.markdown(
         f'<div class="disclaimer">답변은 업로드한 백서를 바탕으로 하며 부정확할 수 있어요. '
