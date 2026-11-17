@@ -1,13 +1,17 @@
 # ════════════════════════════════════════════════════════
-# AIVLE School 학습 도우미 — 조별 통합본 (원본 UI + TOP3 추천 질문)
-# 베이스: 기능 승우+해찬 (화면 배치 그대로: 사이드바 추천 질문 · 오른쪽 히스토리,
+# AIVLE School 학습 도우미 — 조별 통합본 [버전 B: 주제별 TOP3 추천 질문]
+# 베이스: app_v7 (화면 배치 그대로: 사이드바 추천 질문 · 오른쪽 히스토리,
 #         관리자 모드, 답변 근거 '📖 더보기', chroma_db 오류 시 재시도)
 # 반영:   [3차 수정] 관리자 모드 버튼을 누를 때마다 비밀번호 입력
 #         [5차 수정] 답변 본문의 근거 표시는 지우고 '더보기'에 쪽 번호만 표시
-# 추가:   [TOP3] 사이드바 추천 질문 = 많이 묻는 질문 TOP3
-#         - 같은 뜻 질문은 하나로 묶어서 셈 (유사도 0.80 이상 바로, 0.30~0.80은 GPT 확인)
+# 변경:   [주제별 TOP3] 유사도·GPT 판정 대신 '키워드로 주제를 정해서' 셈
+#         - 질문에 주제 키워드가 들어 있으면 그 주제 +1 → 많이 나온 주제 3개의 대표 질문을 추천
+#         - API 호출이 없어 빠르고, 같은 주제는 표현이 달라도 확실히 함께 셈
 #         - 모든 사용자의 질문을 함께 세며, 앱이 재시작(Reboot)되면 0부터 다시 셈
-# 주석의 [TOP3] 표시로 추가된 부분을 찾을 수 있어요.
+# 주석의 [주제별 TOP3] 표시로 해당 부분을 찾을 수 있어요.
+# 추가:   ★ [답변 평가] (소영 파일에서 가져옴) 👍/👎 평가 저장 · CSV 받기 · 만족도,
+#         히스토리를 질문 1개 = 1줄로 표시(만족/불만족 태그, 질문 삭제)
+# 주석의 ★ [답변 평가] 표시로 해당 부분을 찾을 수 있어요.
 # ════════════════════════════════════════════════════════
 # Streamlit Cloud의 sqlite 버전 문제 대비 (chromadb보다 먼저 실행돼야 함, Colab에서는 영향 없음)
 try:
@@ -23,11 +27,13 @@ import shutil      # [2차 수정 1] chroma_db 폴더를 지울 때 사용
 import tempfile
 import warnings
 from operator import itemgetter
+from datetime import datetime          # ★ [답변 평가] 평가한 시각 기록용
+from zoneinfo import ZoneInfo          # ★ [답변 평가] 한국 시간으로 기록하기 위해
 
-import math                      # [TOP3] 질문 유사도(코사인) 계산
-import threading                 # [TOP3] 여러 사용자가 동시에 질문해도 횟수가 꼬이지 않게 잠금
-from collections import Counter  # [TOP3] 질문 횟수 세기
+import threading                 # [주제별 TOP3] 여러 사용자가 동시에 질문해도 횟수가 꼬이지 않게 잠금
+from collections import Counter  # [주제별 TOP3] 주제별 질문 횟수 세기
 
+import pandas as pd                    # ★ [답변 평가] 평가 결과를 표(CSV)로 만들기 위해
 import streamlit as st
 
 warnings.filterwarnings(action="ignore")
@@ -73,7 +79,7 @@ SYSTEM_TEMPLATE = """
 # 역할
 당신은 KT AIVLE School의 친절하고 전문적인 AI 학습 도우미입니다.
 
-당신의 목표는 교육생이 AIVLE School의 교육 과정, 학습 내용, 프로젝트 및 취업 준비와 관련된 정보를 정확하고 쉽게 이해하도록 돕는 것입니다.
+당신의 목표는 에이블스쿨 지원을 고민하는 예비 교육생과 현재 교육생이 AIVLE School의 교육 과정, 학습 내용, 프로젝트 및 취업 준비와 관련된 정보를 정확하고 쉽게 이해하고, 자신 있게 지원하고 도전할 수 있도록 돕는 것입니다.
 
 # 답변 규칙
 
@@ -134,7 +140,7 @@ SYSTEM_TEMPLATE = """
 
 [문서]
 {context}
-""".strip()
+""".strip()   # [통합 수정] 빠져 있던 [문서] {context}를 다시 넣음 → 검색된 백서 문단이 모델에 전달됨
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_TEMPLATE),
@@ -253,207 +259,101 @@ MODEL_NAME = LLM_MODEL       # 하단 안내 문구용 (위 설정값을 그대�
 ADMIN_PASSWORD = "0207"      # [수정 1] 관리자 모드 비밀번호 (바꾸려면 여기만 수정)
 
 # ════════════════════════════════════════════════════════
-# [TOP3] 추천 질문(많이 묻는 질문 TOP3) 기능
+# [주제별 TOP3] 추천 질문(많이 묻는 주제 TOP3) 기능
 # ════════════════════════════════════════════════════════
-# 왼쪽 사이드바 '추천 질문' 3개에 사람들이 많이 물어본 질문을 보여 줍니다.
-#   ① 새 질문을 임베딩(뜻을 숫자 목록으로 바꾼 것)으로 변환
-#   ② 이미 기록된 질문 묶음들과 유사도를 비교
-#   ③ 유사도가 SIMILAR_THRESHOLD 이상이면 같은 질문(+1),
-#      MAYBE_THRESHOLD~SIMILAR 사이면 GPT에게 확인, 그보다 낮으면 새 묶음으로 등록
-#      (처음 들어온 질문이 카드에 보일 대표 문장)
-# ※ 모든 사용자의 질문을 함께 세며, 앱이 재시작되면 0부터 다시 셉니다.
+# 동작 순서
+#   ① 질문에서 띄어쓰기를 지우고, 아래 TOPICS의 키워드가 들어 있는지 확인
+#   ② 키워드가 들어 있는 주제마다 횟수 +1 (한 질문이 여러 주제에 해당하면 모두 +1)
+#   ③ 횟수가 많은 주제 3개의 '대표 질문'을 사이드바 추천 질문에 표시
+#      (기록이 부족하면 TOPICS 맨 앞 주제부터 채움 → 처음 화면은 기존 추천 질문 3개와 같음)
+# - 백서에 없는 질문(NOT_FOUND_MSG)이나 오류 답변은 세지 않음
+# - 어느 주제에도 해당하지 않는 질문은 세지 않음 → 필요하면 TOPICS에 키워드를 추가하세요
 
-# [TOP3] 기본 추천 질문: 질문 기록이 3개가 안 될 때 빈 카드를 채움
-DEFAULT_SUGGESTED = [
-    "비전공자도 따라갈 수 있나요?",
-    "교육비와 자기부담금은 얼마인가요?",
-    "미니 프로젝트는 어떻게 진행되나요?",
+TOP_N = 3   # [주제별 TOP3] 추천 질문 개수
+
+# [주제별 TOP3] 주제 목록: 이름 / 추천 질문으로 보여 줄 대표 질문 / 이 주제로 볼 키워드
+# - 키워드는 띄어쓰기 없이 비교하므로 "자기 부담금", "자기부담금" 모두 잡힘
+# - 맨 앞 3개가 기록이 없을 때 기본으로 보이는 추천 질문
+# - 너무 짧거나 흔한 키워드(예: "자격")는 다른 주제와 겹칠 수 있으니 피하세요
+#   (예: "자격"을 넣으면 "AICE 자격증" 질문도 지원 자격으로 잘못 셈)
+TOPICS = [
+    {"name": "비전공자·난이도", "question": "비전공자도 따라갈 수 있나요?",
+     "keywords": ["비전공", "전공자", "문과", "코딩경험", "초보", "난이도", "따라갈", "따라가"]},
+    {"name": "교육비", "question": "교육비와 자기부담금은 얼마인가요?",
+     "keywords": ["교육비", "비용", "자기부담금", "부담금", "수강료", "학비", "무료", "유료", "돈"]},
+    {"name": "프로젝트", "question": "미니 프로젝트는 어떻게 진행되나요?",
+     "keywords": ["프로젝트", "미프", "빅프", "해커톤", "팀플"]},
+    {"name": "트랙", "question": "어떤 트랙이 있나요?",
+     "keywords": ["트랙", "ai개발자", "dx컨설턴트", "컨설턴트"]},
+    {"name": "훈련장려금", "question": "훈련장려금은 얼마나 받을 수 있나요?",
+     "keywords": ["장려금", "훈련수당", "수당", "지원금"]},
+    {"name": "지원 자격·선발", "question": "지원 자격과 선발 과정은 어떻게 되나요?",
+     "keywords": ["지원자격", "자격요건", "자격조건", "지원조건", "지원할수", "지원방법", "지원하려면",
+                  "선발", "서류", "면접", "코딩테스트", "합격", "전형", "나이", "졸업"]},
+    {"name": "기간·장소", "question": "교육 기간과 장소는 어떻게 되나요?",
+     "keywords": ["기간", "일정", "몇개월", "몇달", "시간표", "수업시간", "출석", "교육장", "장소",
+                  "지역", "지방", "온라인", "오프라인", "대면", "수도권", "제주", "부산", "대구", "광주", "대전"]},
+    {"name": "취업", "question": "수료 후 취업은 어떻게 연결되나요?",
+     "keywords": ["취업", "채용", "우대", "입사", "잡페어", "수료후", "진로"]},
+    {"name": "AICE 자격증", "question": "AICE 자격증은 무엇인가요?",
+     "keywords": ["aice", "에이스", "자격증"]},
+    {"name": "학습 방법·후기", "question": "선배들이 추천하는 공부 방법이 있나요?",
+     "keywords": ["공부", "후기", "조언", "꿀팁", "선배", "복습", "예습", "학습방법", "학습전략"]},
 ]
-TOP_N = 3                    # [TOP3] 추천 질문 카드 개수
 
-# [TOP3 개선] 같은 질문인지 판단하는 기준을 2단계로 나눔
-# 유사도(0~1)는 1에 가까울수록 뜻이 비슷하다는 뜻입니다.
-#   · SIMILAR_THRESHOLD 이상           → 확실히 같은 질문 (바로 +1)
-#   · MAYBE_THRESHOLD ~ SIMILAR 사이   → 애매함 → GPT에게 "같은 질문인가요?" 물어서 결정
-#   · MAYBE_THRESHOLD 미만             → 다른 질문 (새 카드)
-# 예) "트랙이 어떻게 되나요?" ↔ "어떤 트랙이 있나요?"는 뜻은 같지만
-#     표현이 달라 유사도가 0.80보다 낮게 나옴 → 애매 구간에서 GPT가 '같음'으로 판단
-SIMILAR_THRESHOLD = 0.80     # 이 값 이상이면 무조건 같은 질문
-# [TOP3 개선3] 0.50 → 0.30으로 낮춤
-# - 실제 테스트: "어떤 트랙이 있어?" ↔ "트랙이 어떻게 돼?" 유사도가 0.398로 나옴
-#   (짧은 반말 질문은 뜻이 같아도 유사도가 낮게 나옴) → 0.50이면 GPT 확인까지 못 감
-# - 낮춰도 최종 판단은 GPT가 하므로, 다른 질문이 잘못 묶일 가능성은 낮음
-MAYBE_THRESHOLD   = 0.30     # 이 값 이상이면 GPT에게 한 번 더 확인
 
-# [TOP3] 질문 기록 저장소
+# [주제별 TOP3] 주제별 횟수 저장소
 # st.session_state는 사용자마다 따로지만, st.cache_resource는 '모든 사용자'가 함께 씀
 @st.cache_resource
-def get_question_stats():
+def get_topic_stats():
     return {
-        "counts": Counter(),   # {묶음 번호: 횟수}
-        "texts": {},           # {묶음 번호: 카드에 보여줄 대표 문장}
-        "norms": {},           # {묶음 번호: 정리된 대표 문장} → 완전히 같은 질문은 임베딩 없이 찾기
-        "vecs": {},            # [TOP3 개선] {묶음 번호: [묶음에 들어온 질문들의 임베딩 목록]}
-                               #  → 대표 문장 하나가 아니라 묶음의 모든 표현과 비교해서 더 잘 묶임
+        "counts": Counter(),        # {주제 이름: 횟수}
         "lock": threading.Lock(),
     }
 
 
-# [TOP3] 질문 임베딩용 모델 (RAG와 같은 모델, 모든 사용자가 하나를 공유)
-@st.cache_resource
-def get_question_embedder():
-    return OpenAIEmbeddings(model=EMBEDDING_MODEL)
-
-
-def normalize_question(q):
-    """[TOP3] 띄어쓰기·끝의 물음표 차이로 같은 질문이 따로 세지지 않도록 정리"""
-    q = " ".join(q.split())             # 여러 칸 띄어쓰기 → 한 칸
-    return q.rstrip("?？.!~ ").strip()
-
-
-def cosine_similarity(a, b):
-    """[TOP3] 두 임베딩이 얼마나 비슷한지 계산 (1에 가까울수록 같은 뜻)"""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
-    return dot / norm if norm else 0.0
-
-
-def embed_question(text):
-    """[TOP3] 질문 → 임베딩. 실패하면 None (앱이 멈추지 않게)"""
-    try:
-        return get_question_embedder().embed_query(text)
-    except Exception:
-        return None
-
-
-def find_best_group(vec, groups):
-    """[TOP3 개선] 가장 비슷한 묶음 번호와 그 유사도를 함께 돌려줌: (묶음 번호, 유사도)
-    - 묶음 안에 들어온 '모든 질문'과 비교해서 가장 높은 점수를 그 묶음의 점수로 씀
-    - 기록이 하나도 없으면 (None, 0.0)
-    """
-    best_id, best_score = None, 0.0
-    for gid, gvecs in groups.items():
-        for gvec in gvecs:
-            score = cosine_similarity(vec, gvec)
-            if score > best_score:
-                best_id, best_score = gid, score
-    return best_id, best_score
-
-
-# [TOP3 개선] 애매한 경우 같은 질문인지 판단할 GPT (답변용 모델과 같은 모델, 모든 사용자 공유)
-@st.cache_resource
-def get_judge_llm():
-    return ChatOpenAI(model=LLM_MODEL, temperature=0)
-
-
-def is_same_question(q1, q2):
-    """[TOP3 개선2] GPT에게 두 질문이 같은 내용을 묻는지 확인 → (같은지 여부, GPT 원래 대답)
-    - 유사도가 애매한 구간(MAYBE ~ SIMILAR)일 때만 호출되므로 호출 횟수는 적음
-    - 문제였던 점: '예/아니오'로 물으면 GPT가 "네", "'예'"처럼 답해서 같은 질문인데도 False가 됨
-      → 헷갈리지 않게 영어 단어 SAME / DIFFERENT 중 하나로만 답하게 바꿈
-    - 호출에 실패하면 False(다른 질문)로 처리해 앱이 멈추지 않게 함
-    """
-    judge_prompt = (
-        "다음 두 질문이 묻는 내용(의도)이 같은지 판단하세요.\n"
-        "말투, 어미(~요/~어), 어순, 단어 표현만 다르고 알고 싶은 정보가 같으면 같은 질문입니다.\n"
-        "같으면 SAME, 다르면 DIFFERENT 한 단어로만 답하세요.\n"
-        f"질문1: {q1}\n질문2: {q2}"
-    )
-    try:
-        reply = get_judge_llm().invoke(judge_prompt).content.strip()
-        return reply.upper().startswith("SAME"), reply
-    except Exception as e:
-        return False, f"오류: {e}"
+def find_topics(question):
+    """[주제별 TOP3] 질문에 들어 있는 키워드로 해당 주제 이름 목록을 찾음"""
+    text = question.replace(" ", "").lower()   # 띄어쓰기·대소문자 차이 없애기
+    return [t["name"] for t in TOPICS
+            if any(k.replace(" ", "").lower() in text for k in t["keywords"])]
 
 
 def record_question(question, answer):
-    """[TOP3] 답변을 받은 질문을 횟수에 더하기 (같은 뜻 질문은 하나로 묶어서 셈)
+    """[주제별 TOP3] 답변을 받은 질문을 주제별 횟수에 더하기
     - 백서에 없는 질문이나 오류 답변은 추천하면 안 되므로 세지 않음
+    - 판단 결과는 관리자 화면(🔧)에 보여 주려고 top3_debug에 기록
     """
     if NOT_FOUND_MSG in answer or answer.startswith("오류가 발생했어요"):
+        ss["top3_debug"] = f"[{question}] → 백서에 없는 질문/오류라서 세지 않음"
         return
-    key = normalize_question(question)
-    if not key:
+    names = find_topics(question)
+    if not names:
+        ss["top3_debug"] = f"[{question}] → 해당 주제 없음 (세지 않음, 필요하면 TOPICS에 키워드 추가)"
         return
-    stats = get_question_stats()
-
-    # ① 글자까지 완전히 같은 질문이 있으면 → 임베딩 없이 바로 +1 (API 호출 절약)
+    stats = get_topic_stats()
     with stats["lock"]:
-        for gid, norm in stats["norms"].items():
-            if norm == key:
-                stats["counts"][gid] += 1
-                return
-        groups = {g: list(v) for g, v in stats["vecs"].items()}   # [TOP3 개선] 비교용 복사본 (임베딩 목록까지 복사)
-
-    # ② [TOP3 개선] 임베딩으로 가장 비슷한 묶음과 유사도 찾기
-    vec = embed_question(key)
-    gid = None
-    debug = "임베딩 실패 (글자 비교로만 셈)" if vec is None else "비교할 기록 없음 → 새 질문"   # [TOP3 개선2] 판단 과정 기록
-    if vec is not None:
-        best_id, score = find_best_group(vec, groups)
-        if best_id is not None:
-            with stats["lock"]:
-                rep_text = stats["texts"][best_id]          # 가장 비슷한 묶음의 대표 문장
-            debug = f"가장 비슷한 질문: '{rep_text}' / 유사도 {score:.3f}"
-        if score >= SIMILAR_THRESHOLD:
-            gid = best_id                                   # 확실히 같은 질문
-            debug += " → 기준 이상, 같은 질문"
-        elif score >= MAYBE_THRESHOLD:
-            same, reply = is_same_question(question, rep_text)   # 애매 → GPT에게 확인
-            debug += f" → GPT 판정: {reply}"
-            if same:
-                gid = best_id
-        elif best_id is not None:
-            debug += f" → {MAYBE_THRESHOLD} 미만, 다른 질문"
-    ss["top3_debug"] = f"[{question}] {debug}"   # [TOP3 개선2] 관리자 화면에 보여 줄 마지막 판단 결과
-
-    with stats["lock"]:
-        if gid is not None:
-            # ③-1 같은 질문 묶음 → 횟수 +1, 이 표현도 묶음에 추가 (다음 비교에 활용)
-            stats["counts"][gid] += 1
-            stats["vecs"][gid].append(vec)
-        else:
-            # ③-2 처음 보는 질문 → 새 묶음 등록 (이 질문이 카드에 보일 대표 문장)
-            new_id = len(stats["texts"])
-            stats["counts"][new_id] = 1
-            stats["texts"][new_id] = question.strip()
-            stats["norms"][new_id] = key
-            stats["vecs"][new_id] = [vec] if vec is not None else []
-
-
-# [TOP3] 기본 추천 질문의 임베딩 (처음 필요할 때 한 번만 계산)
-@st.cache_resource
-def get_default_vecs():
-    return {q: embed_question(normalize_question(q)) for q in DEFAULT_SUGGESTED}
+        for name in names:
+            stats["counts"][name] += 1
+    ss["top3_debug"] = f"[{question}] → 주제: {', '.join(names)} (+1)"
 
 
 def get_top_questions(n=TOP_N):
-    """[TOP3] 많이 물은 순서로 n개 반환: [(질문, 횟수), ...]
-    - 기록이 부족하면 DEFAULT_SUGGESTED로 채움 (이때 횟수는 None)
-    - 이미 카드에 있는 질문과 뜻이 같은 기본 질문은 건너뜀 (카드 중복 방지)
+    """[주제별 TOP3] 많이 나온 주제 순서로 n개 반환: [(대표 질문, 횟수), ...]
+    - 횟수가 같으면 TOPICS에 적힌 순서대로
+    - 기록이 부족하면 TOPICS 맨 앞 주제부터 채움 (이때 횟수는 None)
     """
-    stats = get_question_stats()
+    stats = get_topic_stats()
     with stats["lock"]:
-        top_ids = [gid for gid, _ in stats["counts"].most_common(n)]
-        top = [(stats["texts"][g], stats["counts"][g]) for g in top_ids]
-        top_norms = {stats["norms"][g] for g in top_ids}
-        top_vecs = {g: stats["vecs"][g] for g in top_ids if g in stats["vecs"]}
-
-    if len(top) >= n:
-        return top
-
-    default_vecs = get_default_vecs() if top_vecs else {}
-    for q in DEFAULT_SUGGESTED:
+        counts = dict(stats["counts"])
+    asked = [t for t in TOPICS if counts.get(t["name"])]
+    asked.sort(key=lambda t: -counts[t["name"]])          # 많이 나온 순 (같으면 TOPICS 순서 유지)
+    top = [(t["question"], counts[t["name"]]) for t in asked[:n]]
+    for t in TOPICS:                                      # 빈자리 채우기
         if len(top) >= n:
             break
-        if normalize_question(q) in top_norms:
-            continue
-        dvec = default_vecs.get(q)
-        # [TOP3 개선] find_best_group으로 바뀜 (화면을 그릴 때마다 GPT를 부르지 않도록
-        #             여기서는 '확실히 같은 질문(SIMILAR_THRESHOLD 이상)'만 건너뜀)
-        if dvec is not None and find_best_group(dvec, top_vecs)[1] >= SIMILAR_THRESHOLD:
-            continue   # 이미 카드에 있는 질문과 같은 뜻 → 건너뜀
-        top.append((q, None))
+        if t["question"] not in [q for q, _ in top]:
+            top.append((t["question"], None))
     return top
 
 
@@ -464,10 +364,10 @@ ss = st.session_state
 ss.setdefault("rag_chain", None)
 ss.setdefault("file_hash", None)
 ss.setdefault("file_name", None)
-ss.setdefault("file_data", None)  # [6차 수정 1] 업로드한 PDF 원본 (다운로드 버튼용)
 ss.setdefault("chats", {})        # {대화ID: {"title": 제목, "messages": [...]}}
 ss.setdefault("current_id", None)
 ss.setdefault("is_admin", False)  # [수정 2] 관리자 인증 여부 (비밀번호를 맞히면 True)
+ss.setdefault("feedback", {})     # ★ [답변 평가] {"답변ID": {평가 한 줄}} — CSV로 저장될 내용
 
 
 def new_chat():
@@ -524,7 +424,6 @@ def build_chain(uploaded_file):
                 ss.rag_chain = rag_pipeline(tmp_path)
         ss.file_hash = file_hash
         ss.file_name = uploaded_file.name
-        ss.file_data = data   # [6차 수정 2] 다운로드할 수 있도록 PDF 원본을 보관
     finally:
         os.remove(tmp_path)
 
@@ -562,6 +461,23 @@ def admin_dialog():
             else:
                 st.rerun()   # 팝업을 닫고 화면 전체를 새로 그림 (배지·입력창 활성화)
 
+        # ★ [답변 평가] 관리자만 보는 만족도 + CSV 다운로드
+        st.divider()
+        df = feedback_df()
+        total = len(df)                              # 평가한 답변 수
+        good = int((df["점수"] == 1).sum())          # 👍 받은 답변 수
+        rate = round(good / total * 100) if total > 0 else 0   # 만족도(%)
+
+        st.markdown(f"**답변 만족도**  {rate}% ({good}/{total})")
+        st.download_button(
+            "⬇️  평가 결과 CSV 받기",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="feedback.csv",
+            mime="text/csv",
+            width="stretch",
+            disabled=total == 0,                     # 평가가 하나도 없으면 비활성화
+        )
+
 
 def ask(question):
     try:
@@ -590,6 +506,152 @@ def show_sources(sources):
         st.markdown(", ".join(f"**{p}**" for p in pages))
 
 
+# ════════════════════════════════════════════════════════
+# ★ [답변 평가] 👍/👎 평가를 저장하고 CSV로 만드는 부분
+# ════════════════════════════════════════════════════════
+
+FEEDBACK_FILE = "feedback.csv"                                   # 저장할 파일 이름
+FEEDBACK_COLUMNS = ["평가시각", "대화제목", "질문", "답변", "평가", "점수"]   # CSV 열 순서
+
+
+def get_feedback():
+    """평가 장부를 꺼내 줍니다. 장부가 없으면(앱 재시작·재배포 직후 등) 빈 장부를 새로 만들어 줍니다.
+
+    ss.feedback 처럼 바로 꺼내면 장부가 없을 때 AttributeError가 나기 때문에,
+    평가 장부는 항상 이 함수로만 꺼내 씁니다.
+    """
+    return ss.setdefault("feedback", {})
+
+
+def feedback_df():
+    """지금까지 받은 평가를 표(DataFrame)로 만들어 돌려줍니다."""
+    rows = list(get_feedback().values())
+    return pd.DataFrame(rows, columns=FEEDBACK_COLUMNS)
+
+
+def save_feedback_csv():
+    """평가 표를 feedback.csv 파일로 저장합니다. (엑셀에서 한글이 안 깨지도록 utf-8-sig)"""
+    feedback_df().to_csv(FEEDBACK_FILE, index=False, encoding="utf-8-sig")
+
+
+def msg_id(m):
+    """메시지의 고유 ID를 돌려줍니다. 없으면 새로 만들어 붙입니다.
+
+    질문을 삭제하면 메시지 순서(0, 1, 2...)가 당겨지기 때문에,
+    순서 번호 대신 절대 바뀌지 않는 ID로 메시지를 구분합니다.
+    """
+    return m.setdefault("id", uuid.uuid4().hex[:8])
+
+
+def find_index(messages, target_id):
+    """메시지 목록에서 ID가 target_id인 메시지가 몇 번째인지 찾습니다. 없으면 None."""
+    for i, m in enumerate(messages):
+        if m.get("id") == target_id:
+            return i
+    return None
+
+
+def save_rating(chat_id, answer_id, value):
+    """👍/👎 버튼의 값이 바뀌었을 때 평가를 저장하는 함수입니다.
+
+    chat_id   : 어떤 대화인지
+    answer_id : 평가한 답변의 고유 ID
+    value     : 버튼 값 (1 = 👍, 0 = 👎, None = 평가 취소)
+    """
+
+    chat = ss.chats.get(chat_id)
+    if chat is None:
+        return
+    messages = chat["messages"]
+    idx = find_index(messages, answer_id)
+    if idx is None:
+        return
+    messages[idx]["rating"] = value    # 히스토리에 표시하려고 답변 메시지 안에도 적어 둠
+
+    # 답변 ID가 장부의 이름표 → 평가를 바꾸면 덮어쓰기(중복 X)
+    if value is None:
+        get_feedback().pop(answer_id, None)
+    else:
+        get_feedback()[answer_id] = {
+            "평가시각": datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S"),
+            "대화제목": chat["title"],
+            "질문": messages[idx - 1]["content"],   # 답변 바로 앞 메시지가 질문
+            "답변": messages[idx]["content"],
+            "평가": "만족" if value == 1 else "불만족",
+            "점수": value,                            # 만족도 계산용 숫자 (1 또는 0)
+        }
+
+    save_feedback_csv()
+
+
+def rating_tag(rating):
+    """평가 값(1, 0, None)을 히스토리용 태그로 바꿔 줍니다. 평가 안 했으면 빈 문자열."""
+    if rating == 1:
+        return '<span class="rate-tag good">만족</span>'
+    if rating == 0:
+        return '<span class="rate-tag bad">불만족</span>'
+    return ""
+
+
+def history_items():
+    """모든 대화의 질문을 하나씩 꺼내 '히스토리 목록'을 만듭니다. (최신 질문이 맨 위)
+
+    목록 한 줄 = 질문 1개이고, 그 질문 바로 다음 답변의 평가를 함께 담습니다.
+    """
+    items = []
+    for chat_id, chat in ss.chats.items():
+        messages = chat["messages"]
+        for i, m in enumerate(messages):
+            if m["role"] != "user":
+                continue
+            has_answer = i + 1 < len(messages) and messages[i + 1]["role"] == "assistant"
+            answer = messages[i + 1] if has_answer else None
+            items.append({
+                "chat_id": chat_id,
+                "question": m,
+                "answer": answer,
+                "rating": answer.get("rating") if answer else None,
+            })
+    # seq = 질문한 순서 번호 → 큰 번호(최신)가 위로
+    items.sort(key=lambda it: it["question"].get("seq", 0), reverse=True)
+    return items
+
+
+def delete_question(chat_id, question_id):
+    """히스토리 목록의 ✕ 버튼: 질문 1개와 그 답변을 대화에서 지웁니다.
+
+    평가 장부(CSV)의 기록은 결과 보고서용이므로 지우지 않고 남겨 둡니다.
+    """
+    chat = ss.chats.get(chat_id)
+    if chat is None:
+        return
+    messages = chat["messages"]
+    i = find_index(messages, question_id)
+    if i is None:
+        return
+
+    # 지울 범위: 질문 + (있으면) 바로 다음 답변
+    end = i + 2 if i + 1 < len(messages) and messages[i + 1]["role"] == "assistant" else i + 1
+    for m in messages[i:end]:
+        ss.pop(f"fb_{m.get('id')}", None)        # 지운 답변의 버튼 상태도 정리
+    del messages[i:end]
+
+    if ss.get("selected_q") == question_id:
+        ss.selected_q = None
+
+    remaining = [m for m in messages if m["role"] == "user"]
+    if remaining:
+        chat["title"] = remaining[0]["content"][:20]   # 첫 질문이 지워졌으면 제목도 다음 질문으로
+    elif chat_id == ss.current_id:
+        chat["title"] = "새 대화"                       # 보고 있던 대화는 빈 대화로 남김
+    else:
+        delete_chat(chat_id)                            # 질문이 하나도 안 남은 다른 대화는 정리
+
+
+# ★ [답변 평가] 히스토리 목록에서 강조할 질문 (지금 보고 있는 대화 안에 있을 때만)
+selected = ss.get("selected_q")
+active_q = selected if find_index(ss.chats[ss.current_id]["messages"], selected) is not None else "none"
+
 # ── 스타일 ──────────────────────────────────────────────
 st.markdown(f"""
 <style>
@@ -611,16 +673,57 @@ st.markdown(f"""
 [data-testid="stSidebar"] .st-key-nav_admin {{ position: fixed; bottom: 1.2rem; }}
 
 /* 사이드바 하단 문서 카드 */
-/* [6차 수정 3] 카드 테두리를 바깥 상자(.st-key-doc_card)로 옮김 → 다운로드 버튼도 카드 안에 들어감 */
-.st-key-doc_download {{ position: relative; top: 16px; }}
-.st-key-doc_card {{
-    margin-top: 1.5rem; padding: 12px 14px 28px; border: 1px solid rgba(0,0,0,0.1);
-    border-radius: 12px;
+.doc-card {{
+    margin-top: 1.5rem; padding: 12px 14px; border: 1px solid rgba(0,0,0,0.1);
+    border-radius: 12px; font-size: 0.85rem; line-height: 1.4;
 }}
-.doc-card {{ font-size: 0.85rem; line-height: 1.4; word-break: break-all; }}
 .doc-card .label {{ color: #888; font-size: 0.75rem; }}
-.st-key-doc_download button {{ padding: 2px 8px; min-height: 0; font-size: 1.1rem; color: #555; }}
-.st-key-doc_download button:hover {{ background-color: rgba(0,0,0,0.06); color: #111; }}
+
+/* ★ [답변 평가] 히스토리 카드의 만족/불만족 태그 */
+.rate-tag {{
+    display: inline-block; font-size: 0.72rem; font-weight: 600;
+    padding: 1px 8px; border-radius: 999px; line-height: 1.6;
+}}
+.rate-tag.good {{ background: #e6f4ea; color: #1e7b34; }}
+.rate-tag.bad  {{ background: #fdecea; color: #b42318; }}
+
+/* ★ [답변 평가] 히스토리 목록: 한 줄 = 질문 1개 (질문 · 태그 · ✕) */
+[class*="st-key-hrow_"] {{
+    padding: 0 6px 0 12px; border-radius: 10px; gap: 6px; flex-wrap: nowrap;
+}}
+[class*="st-key-hrow_"]:hover {{ background: rgba(0,0,0,0.04); }}
+.st-key-hrow_{active_q} {{ background: #f1f2f4; }}
+.st-key-hrow_{active_q} [class*="st-key-hopen_"] button p {{ font-weight: 600; }}
+[class*="st-key-hopen_"] {{ flex: 1 1 0; min-width: 0; }}
+[class*="st-key-hopen_"] button {{
+    justify-content: flex-start; padding: 8px 0; min-height: 0; color: inherit; width: 100%;
+}}
+[class*="st-key-hopen_"] button > div {{ justify-content: flex-start; width: 100%; min-width: 0; }}
+[class*="st-key-hopen_"] button p {{
+    width: 100%; text-align: left; font-size: 0.88rem;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+[class*="st-key-hopen_"] button:hover {{ color: inherit; }}
+[class*="st-key-hdel_"] button {{ color: #aaa; padding: 0 2px; min-height: 0; }}
+[class*="st-key-hdel_"] button:hover {{ color: #e5484d; }}
+
+/* ★ [답변 평가] 채팅 답변 아래 👍/👎 버튼: 테두리 버튼으로 만들고, 눌린 버튼은 색을 꽉 채움 */
+[data-testid="stFeedback"] button {{
+    border: 1px solid rgba(0,0,0,0.15); border-radius: 8px;
+    padding: 4px 10px; background: #fff; color: #666;
+}}
+[data-testid="stFeedback"] button:hover {{ border-color: rgba(0,0,0,0.35); color: #333; }}
+[data-testid="stFeedback"] button[aria-label="Thumbs up"][aria-checked="true"] {{
+    background: #1e7b34 !important; border-color: #1e7b34 !important; color: #fff !important;
+}}
+[data-testid="stFeedback"] button[aria-label="Thumbs down"][aria-checked="true"] {{
+    background: #b42318 !important; border-color: #b42318 !important; color: #fff !important;
+}}
+/* 눌린 버튼의 아이콘은 속이 꽉 찬 모양으로 */
+[data-testid="stFeedback"] button[aria-checked="true"] [data-testid="stIconMaterial"] {{
+    font-variation-settings: "FILL" 1; color: #fff !important;
+}}
+[data-testid="stFeedback"] [role="radiogroup"] {{ gap: 6px; }}
 
 /* 상단 바 */
 .topbar {{
@@ -685,38 +788,28 @@ with st.sidebar:
         new_chat()
         st.rerun()
 
-    # [TOP3] 추천 질문 = 많이 묻는 질문 TOP3 (원본 위치·모양 그대로, 내용만 자동으로 바뀜)
-    # - 실제로 물어본 질문: 🔥 아이콘 (마우스를 올리면 질문 횟수 표시)
-    # - 기록이 부족해 채운 기본 질문: 💡 아이콘
-    # - 누르면 그 질문이 바로 채팅으로 들어감 (pending_question)
-    st.caption("추천 질문 · 많이 묻는 질문 TOP3")
+    # [주제별 TOP3] 추천 질문 = 많이 묻는 주제 TOP3의 대표 질문 (원본 위치·모양 그대로)
+    # - 실제로 질문이 들어온 주제: 🔥 아이콘 (마우스를 올리면 그 주제 질문 횟수 표시)
+    # - 기록이 부족해 채운 기본 주제: 💡 아이콘
+    # - 누르면 대표 질문이 바로 채팅으로 들어감 (pending_question)
+    st.caption("추천 질문 · 많이 묻는 주제 TOP3")
     for i, (q, cnt) in enumerate(get_top_questions()):
         icon = "🔥" if cnt else "💡"
-        tip = f"{cnt}회 질문됨" if cnt else "기본 추천 질문"
+        tip = f"이 주제 질문 {cnt}회" if cnt else "기본 추천 질문"
         if st.button(f"{icon}  {q}", key=f"nav_q{i}", width="stretch", type="tertiary",
                      help=tip, disabled=ss.rag_chain is None):
             ss.pending_question = q
 
-    # [TOP3] 관리자 확인용: 마지막 질문이 어떻게 판단됐는지 표시
+    # [주제별 TOP3] 관리자 확인용: 마지막 질문이 어느 주제로 세졌는지 표시
     # (관리자 모드로 로그인한 사람에게만 보임 → 시연 화면에는 안 나옴)
     if ss.is_admin and ss.get("top3_debug"):
         st.caption(f"🔧 {ss.top3_debug}")
 
     doc = ss.file_name or "아직 문서가 없어요"
-    # [6차 수정 4] 적용된 문서 카드 오른쪽에 다운로드 버튼 추가
-    #  (문서가 적용된 뒤에만 버튼이 보임)
-    with st.container(key="doc_card"):
-        d1, d2 = st.columns([5, 1], gap="small", vertical_alignment="bottom")
-        d1.markdown(
-            f'<div class="doc-card"><div class="label">적용된 문서</div>📄 {doc}</div>',
-            unsafe_allow_html=True,
-        )
-        if ss.file_data is not None:
-            d2.download_button(
-                "⬇", data=ss.file_data, file_name=ss.file_name, mime="application/pdf",
-                key="doc_download", help="백서 PDF 다운로드", type="tertiary",
-                on_click="ignore",   # 눌러도 화면을 다시 그리지 않고 파일만 내려받음
-            )
+    st.markdown(
+        f'<div class="doc-card"><div class="label">적용된 문서</div>📄 {doc}</div>',
+        unsafe_allow_html=True,
+    )
 
     # [수정 5] 관리자 모드 버튼 (누르면 비밀번호 팝업이 열림)
     if st.button("관리자 모드  →", key="nav_admin", type="tertiary"):
@@ -736,32 +829,40 @@ st.markdown(
 # ── 본문: 채팅(가운데) · 히스토리(오른쪽) ───────────────
 chat_col, hist_col = st.columns([3, 1], gap="large")
 
-# 오른쪽: 히스토리 카드
+# 오른쪽: 히스토리 목록 (★ [답변 평가] 대화 카드 대신 질문 1개 = 1줄)
 with hist_col:
-    st.markdown(f"**히스토리** <span style='color:#999'>({len(ss.chats)})</span>",
+    items = history_items()
+    if keyword:   # 대화 검색: 질문이나 답변에 검색어가 있는 줄만
+        items = [it for it in items
+                 if keyword in it["question"]["content"]
+                 or (it["answer"] and keyword in it["answer"]["content"])]
+
+    st.markdown(f"**히스토리** <span style='color:#999'>({len(items)})</span>",
                 unsafe_allow_html=True)
-    for chat_id, chat in reversed(list(ss.chats.items())):
-        text = chat["title"] + " ".join(m["content"] for m in chat["messages"])
-        if keyword and keyword not in text:
-            continue
+    if not items:
+        st.caption("아직 질문이 없어요")
 
-        answers = [m["content"] for m in chat["messages"] if m["role"] == "assistant"]
-        preview = answers[-1] if answers else "아직 대화가 없어요"
-        preview = " ".join(preview.split())   # 줄바꿈 없이 한 줄로
+    for it in items:
+        q = it["question"]
+        q_id = msg_id(q)
+        q_text = " ".join(q["content"].split())    # 줄바꿈 없이 한 줄로
 
-        with st.container(key=f"card_{chat_id}"):
-            c1, c2 = st.columns([6, 1], gap="small", vertical_alignment="center")
-            if c1.button(chat["title"], key=f"open_{chat_id}", width="stretch", type="tertiary"):
-                ss.current_id = chat_id
+        # 한 줄 안에 [질문 ......] [태그] [✕] 를 가로로 배치
+        with st.container(key=f"hrow_{q_id}", horizontal=True, vertical_alignment="center"):
+            if st.button(q_text, key=f"hopen_{q_id}", type="tertiary", width="stretch"):
+                ss.current_id = it["chat_id"]      # 이 질문이 있는 대화를 열고
+                ss.selected_q = q_id               # 목록에서 이 줄을 강조
                 st.rerun()
-            if c2.button("✕", key=f"del_{chat_id}", help="대화 삭제", type="tertiary"):
-                delete_chat(chat_id)
+            tag = rating_tag(it["rating"])
+            if tag:
+                st.markdown(tag, unsafe_allow_html=True, width="content")
+            if st.button("✕", key=f"hdel_{q_id}", help="질문 삭제", type="tertiary"):
+                delete_question(it["chat_id"], q_id)
                 st.rerun()
-            st.caption(preview)
 
 # 가운데: 대화 영역 + 다시 생성 + 입력창
 with chat_col:
-    chat_box = st.container(height=470, border=False)
+    chat_box = st.container(height=730, border=False)
 
     # 다시 생성: 마지막 질문으로 답변을 새로 받기
     regenerate = False
@@ -789,7 +890,18 @@ with chat_col:
                 st.markdown(msg["content"])
                 if msg["role"] == "assistant":
                     show_sources(msg.get("sources", []))  # 수정: 이전 답변의 근거 유지
-                    st.feedback("thumbs", key=f"fb_{ss.current_id}_{idx}")
+                    # ★ [답변 평가] 답변마다 👍/👎 버튼 (답변 고유 ID로 구분)
+                    a_id = msg_id(msg)
+                    fb_key = f"fb_{a_id}"
+                    # 다른 대화를 보다가 돌아오면 버튼 상태가 지워지므로, 저장해 둔 평가로 되살림
+                    if fb_key not in ss and msg.get("rating") is not None:
+                        ss[fb_key] = msg["rating"]
+                    # 버튼이 돌려주는 값(1, 0, None)을 바로 받아서 사용
+                    new_value = st.feedback("thumbs", key=fb_key)
+                    # 저장된 평가와 다르면 = 방금 버튼을 눌렀다는 뜻 → 저장하고 화면 새로 그리기
+                    if new_value != msg.get("rating"):
+                        save_rating(ss.current_id, a_id, new_value)
+                        st.rerun()   # 히스토리 태그를 바로 갱신
 
         if regenerate:
             last_q = next(m["content"] for m in reversed(current["messages"]) if m["role"] == "user")
@@ -799,6 +911,12 @@ with chat_col:
                 # 수정: 다시 생성할 때 답변과 근거 모두 갱신
                 current["messages"][-1]["content"] = new_answer["answer"]
                 current["messages"][-1]["sources"] = new_answer["sources"]
+                # ★ [답변 평가] 답변이 바뀌었으니 예전 평가는 지움
+                last_id = msg_id(current["messages"][-1])
+                current["messages"][-1]["rating"] = None
+                ss.pop(f"fb_{last_id}", None)
+                get_feedback().pop(last_id, None)
+                save_feedback_csv()
             st.rerun()
 
         if question:
@@ -806,7 +924,11 @@ with chat_col:
             if not current["messages"]:
                 current["title"] = question[:20]
 
-            current["messages"].append({"role": "user", "content": question})
+            # ★ [답변 평가] 질문마다 고유 ID와 질문 순서(seq)를 붙임 → 히스토리 정렬·강조에 사용
+            ss.q_seq = ss.get("q_seq", 0) + 1
+            q_msg = {"role": "user", "content": question, "seq": ss.q_seq}
+            current["messages"].append(q_msg)
+            ss.selected_q = msg_id(q_msg)
             with st.chat_message("user"):
                 st.markdown(question)
 
@@ -821,8 +943,9 @@ with chat_col:
                 "role": "assistant",
                 "content": result["answer"],
                 "sources": result["sources"],
+                "rating": None,   # ★ [답변 평가] 아직 평가 안 함
             })
-            # [TOP3] 이 질문을 추천 질문 TOP3 집계에 반영
+            # [주제별 TOP3] 이 질문을 주제별 횟수에 반영
             # (ask()가 {"answer", "sources"}를 돌려주므로 답변 글자인 result["answer"]를 넘김)
             record_question(question, result["answer"])
             st.rerun()   # 히스토리 제목·미리보기·추천 질문 TOP3를 바로 갱신
