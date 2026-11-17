@@ -675,14 +675,14 @@ st.markdown(f"""
 [data-testid="stSidebar"] .st-key-nav_admin {{ position: fixed; bottom: 1.2rem; }}
 
 /* 사이드바 하단 문서 카드 */
+.st-key-doc_download {{ position: relative; top: 10px; }}
 .st-key-doc_card {{
-    margin-top: 1.5rem; padding: 12px 14px; border: 1px solid rgba(0,0,0,0.1);
+    margin-top: 1.5rem; padding: 12px 14px 28px; border: 1px solid rgba(0,0,0,0.1);
     border-radius: 12px;
 }}
 .doc-card {{ font-size: 0.85rem; line-height: 1.4; word-break: break-all; }}
 .doc-card .label {{ color: #888; font-size: 0.75rem; }}
 .st-key-doc_download button {{ padding: 2px 8px; min-height: 0; font-size: 1.1rem; color: #555; }}
-.st-key-doc_download button:hover {{ background-color: rgba(0,0,0,0.06); color: #111; }}
 
 /* ★ [답변 평가] 히스토리 카드의 만족/불만족 태그 */
 .rate-tag {{
