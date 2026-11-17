@@ -373,6 +373,8 @@ with st.sidebar:
 
     # [수정 5] 관리자 모드 버튼 (누르면 비밀번호 팝업이 열림)
     if st.button("관리자 모드  →", key="nav_admin", type="tertiary"):
+        # [3차 수정 1] 버튼을 누를 때마다 인증을 초기화 → 매번 비밀번호를 다시 입력해야 함
+        ss.is_admin = False
         admin_dialog()
 
 current = ss.chats[ss.current_id]
